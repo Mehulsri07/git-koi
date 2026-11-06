@@ -1035,8 +1035,10 @@ fn sample_koi(
 /// curve. When the full scan keeps nothing, the closest listed segment is no closer
 /// than the true closest, so the grid keeps nothing either; an empty cell or a position
 /// off the grid keeps nothing.
-struct SegmentGrid<'a> {
-    curve_points: &'a [CurvePoint],
+struct SegmentGrid {
+    segments: Vec<SegmentTerms>,
+    /// The curve's last point index, which along fractions divide by.
+    last_point_index: f64,
     origin: [f64; 2],
     cell_size_pixels: f64,
     column_count: usize,
@@ -1046,8 +1048,8 @@ struct SegmentGrid<'a> {
     segment_indices: Vec<usize>,
 }
 
-impl<'a> SegmentGrid<'a> {
-    fn new(curve_points: &'a [CurvePoint]) -> Self {
+impl SegmentGrid {
+    fn new(curve_points: &[CurvePoint]) -> Self {
         // Covers rounding in the distance and the box arithmetic, which could otherwise
         // leave a sample at exactly the largest half width just outside its segment's
         // grown box; listing a few more segments never changes a sample.
@@ -1118,7 +1120,11 @@ impl<'a> SegmentGrid<'a> {
             }
         }
         Self {
-            curve_points,
+            segments: curve_points
+                .windows(2)
+                .map(|end_points| SegmentTerms::new(end_points[0], end_points[1]))
+                .collect(),
+            last_point_index: (curve_points.len() - 1) as f64,
             origin,
             cell_size_pixels,
             column_count,
@@ -1141,32 +1147,79 @@ impl<'a> SegmentGrid<'a> {
         let cell_index = row as usize * self.column_count + column as usize;
         let listed_segments =
             &self.segment_indices[self.cell_starts[cell_index]..self.cell_starts[cell_index + 1]];
-        sample_segments(
-            self.curve_points,
-            listed_segments.iter().copied(),
-            sample_position,
-        )
+        // The arithmetic and tie rule of `sample_curve`, over the listed segments only,
+        // with each segment's own terms computed once per frame by the same expressions.
+        let mut closest_sample = None;
+        let mut closest_distance_pixels = f64::INFINITY;
+        for &segment_index in listed_segments {
+            let segment = &self.segments[segment_index];
+            let [segment_x, segment_y] = segment.direction;
+            let offset_x = sample_position[0] - segment.start_position[0];
+            let offset_y = sample_position[1] - segment.start_position[1];
+            let segment_progress = ((offset_x * segment_x + offset_y * segment_y)
+                / segment.squared_length_pixels)
+                .clamp(0.0, 1.0);
+            let distance_pixels = (offset_x - segment_progress * segment_x)
+                .hypot(offset_y - segment_progress * segment_y);
+            if distance_pixels >= closest_distance_pixels {
+                continue;
+            }
+            closest_distance_pixels = distance_pixels;
+            closest_sample = Some(CurveSample {
+                along_fraction: (segment_index as f64 + segment_progress) / self.last_point_index,
+                lateral_pixels: (offset_x * segment_y - offset_y * segment_x)
+                    / segment.length_pixels,
+                distance_pixels,
+                half_width_pixels: segment.start_half_width_pixels
+                    + segment_progress * segment.half_width_change_pixels,
+                normal_direction: segment.normal_direction,
+            });
+        }
+        closest_sample
+            .filter(|curve_sample| curve_sample.distance_pixels <= curve_sample.half_width_pixels)
     }
 }
 
-/// Sample the closest point on the whole curve, scanning every segment.
-#[cfg(test)]
-fn sample_curve(curve_points: &[CurvePoint], sample_position: [f64; 2]) -> Option<CurveSample> {
-    sample_segments(curve_points, 0..curve_points.len() - 1, sample_position)
+/// One segment's terms that do not depend on the sample position.
+struct SegmentTerms {
+    start_position: [f64; 2],
+    direction: [f64; 2],
+    length_pixels: f64,
+    squared_length_pixels: f64,
+    start_half_width_pixels: f64,
+    half_width_change_pixels: f64,
+    normal_direction: [f64; 2],
+}
+
+impl SegmentTerms {
+    fn new(start_point: CurvePoint, end_point: CurvePoint) -> Self {
+        let segment_x = end_point.position[0] - start_point.position[0];
+        let segment_y = end_point.position[1] - start_point.position[1];
+        let segment_length_pixels = segment_x.hypot(segment_y);
+        Self {
+            start_position: start_point.position,
+            direction: [segment_x, segment_y],
+            length_pixels: segment_length_pixels,
+            squared_length_pixels: segment_length_pixels.powi(2),
+            start_half_width_pixels: start_point.half_width_pixels,
+            half_width_change_pixels: end_point.half_width_pixels - start_point.half_width_pixels,
+            normal_direction: [
+                segment_y / segment_length_pixels,
+                -segment_x / segment_length_pixels,
+            ],
+        }
+    }
 }
 
 // Constructed curves contain at least two points and no zero-length segments.
-// Segment indices must ascend; the first strict minimum wins.
-fn sample_segments(
-    curve_points: &[CurvePoint],
-    segment_indices: impl Iterator<Item = usize>,
-    sample_position: [f64; 2],
-) -> Option<CurveSample> {
+/// Sample the closest point on the whole curve, scanning every segment: the reference
+/// that [`SegmentGrid`] sampling must match exactly.
+#[cfg(test)]
+fn sample_curve(curve_points: &[CurvePoint], sample_position: [f64; 2]) -> Option<CurveSample> {
     let mut closest_sample = None;
     let mut closest_distance_pixels = f64::INFINITY;
-    for segment_index in segment_indices {
-        let [start_point, end_point] =
-            [curve_points[segment_index], curve_points[segment_index + 1]];
+    for (segment_index, end_points) in curve_points.windows(2).enumerate() {
+        let [start_point, end_point] = [end_points[0], end_points[1]];
         let segment_x = end_point.position[0] - start_point.position[0];
         let segment_y = end_point.position[1] - start_point.position[1];
         let offset_x = sample_position[0] - start_point.position[0];
