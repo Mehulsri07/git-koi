@@ -70,15 +70,15 @@ nodes {
 `$userId` is the user's node `id`, which the account query now also returns. A
 repository with no default branch has 0 commits.
 
-`RepositoryObservation` gains two required fields:
-
-- `owned: bool`: true for repositories that come from the owned connection.
-- `owner_commit_count: u64`: 0 for repositories that are not owned.
-
-`deny_unknown_fields` stays, and both fields are required. A 1.x snapshot fails
-to load with an error that says to re-collect. This is the breaking change
-behind 2.0. Language shares keep their current rule over all repositories, so
-the koi's coat does not change.
+Snapshot version 4 adds one field to `AccountSnapshot`:
+`owned_repositories: Option<Vec<OwnedRepository>>`, where
+`OwnedRepository { repository_id: u64, owner_commit_count: u64 }` lists every
+public, non-fork repository the account owns. `RepositoryObservation` is
+unchanged. Versions 1 to 3 still load, with `owned_repositories: None`, and
+still render the normal koi. `--pond` needs version 4 and fails with "the pond
+needs a snapshot collected by git-koi 2.0; run git-koi collect again". Adding a
+public field to `AccountSnapshot` is the breaking change behind 2.0. Language
+shares are unchanged.
 
 ## Modules
 
@@ -176,7 +176,8 @@ All tests sit at public boundaries, as the existing suite does.
   maximum koi with 12 size-5 pads stays under the 1 MB budget.
 - Rest and feeding frames stay inside the canvas.
 - Regression: without `--pond`, 1.0.2 fixtures render byte-identical outputs.
-- Snapshot v1 loading fails with the re-collect message.
+- Snapshots v1 to v3 still load and render the normal koi; `--pond` on one fails
+  with the re-collect message.
 - The review library (`examples/generate-library.rs`) gains pond sheets on the
   light and dark backgrounds.
 
