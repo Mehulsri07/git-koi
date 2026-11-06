@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use chrono::{Datelike, Days, NaiveDate};
 use git_koi::history::{
     AccountSnapshot, ConflictingRepository, ContributionDay, ContributionHistory,
-    ContributionHistoryError, LanguageColor, RepositoryVisibility, calculate_language_shares,
-    summarize_contributions,
+    ContributionHistoryError, LanguageColor, OwnedRepository, RepositoryVisibility,
+    calculate_language_shares, summarize_contributions,
 };
 
 const ACCOUNT_JSON: &str = include_str!("fixtures/account.json");
@@ -382,4 +382,59 @@ fn snapshot_versions_enforce_their_own_history_fields() {
     ] {
         assert!(serde_json::from_value::<AccountSnapshot>(incompatible_document).is_err());
     }
+}
+
+#[test]
+fn version_4_round_trips_owned_repositories() {
+    let mut account_snapshot: AccountSnapshot =
+        serde_json::from_str(ACCOUNT_WITH_HISTORY_JSON).unwrap();
+    account_snapshot.owned_repositories = Some(vec![
+        OwnedRepository {
+            repository_id: 7,
+            owner_commit_count: 120,
+        },
+        OwnedRepository {
+            repository_id: 9,
+            owner_commit_count: 0,
+        },
+    ]);
+    let snapshot_document = serde_json::to_value(&account_snapshot).unwrap();
+    assert_eq!(snapshot_document["schema_version"], 4);
+    let restored_snapshot: AccountSnapshot = serde_json::from_value(snapshot_document).unwrap();
+    assert_eq!(restored_snapshot, account_snapshot);
+}
+
+#[test]
+fn version_3_loads_without_owned_repositories() {
+    let account_snapshot: AccountSnapshot =
+        serde_json::from_str(ACCOUNT_WITH_HISTORY_JSON).unwrap();
+    assert_eq!(account_snapshot.owned_repositories, None);
+}
+
+#[test]
+fn owned_repositories_is_not_a_field_before_version_4() {
+    let mut snapshot_document: serde_json::Value =
+        serde_json::from_str(ACCOUNT_WITH_HISTORY_JSON).unwrap();
+    snapshot_document["owned_repositories"] = serde_json::json!([]);
+    let error = serde_json::from_value::<AccountSnapshot>(snapshot_document).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("owned_repositories is not a field before snapshot version 4"),
+        "{error}"
+    );
+}
+
+#[test]
+fn version_4_needs_owned_repositories() {
+    let mut snapshot_document: serde_json::Value =
+        serde_json::from_str(ACCOUNT_WITH_HISTORY_JSON).unwrap();
+    snapshot_document["schema_version"] = serde_json::json!(4);
+    let error = serde_json::from_value::<AccountSnapshot>(snapshot_document).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("missing owned_repositories in snapshot version 4"),
+        "{error}"
+    );
 }

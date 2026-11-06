@@ -13,7 +13,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// public, non-fork ones affect language shares, so a public-only collection is enough.
 /// Parsing verifies the format, not collection completeness.
 /// Older snapshots remain usable for language shares but have no contribution history
-/// or language colors. Language colors require contribution history (version 3).
+/// or language colors. Language colors require contribution history (version 3), and
+/// owned repositories require language colors (version 4).
 /// Serialization selects the format from the available observations. Unknown fields,
 /// unsupported versions, and missing fields within a supported format are rejected.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -27,6 +28,18 @@ pub struct AccountSnapshot {
     pub contribution_history: Option<ContributionHistory>,
     /// GitHub's color for each observed language name; `None` means GitHub has no color.
     pub language_colors: Option<BTreeMap<String, Option<LanguageColor>>>,
+    /// The owner's commit count in each owned repository; `None` before snapshot version 4.
+    pub owned_repositories: Option<Vec<OwnedRepository>>,
+}
+
+/// The account owner's commit count in one repository the account owns.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedRepository {
+    /// GitHub's stable numeric ID for the repository.
+    pub repository_id: u64,
+    /// How many commits the account owner authored in the repository.
+    pub owner_commit_count: u64,
 }
 
 /// A GitHub language color, written as `#rrggbb`.
@@ -358,6 +371,8 @@ struct SnapshotDocument {
         skip_serializing_if = "Option::is_none"
     )]
     language_colors: Option<BTreeMap<String, Option<LanguageColor>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owned_repositories: Option<Vec<OwnedRepository>>,
 }
 
 impl TryFrom<SnapshotDocument> for AccountSnapshot {
@@ -366,6 +381,7 @@ impl TryFrom<SnapshotDocument> for AccountSnapshot {
     fn try_from(snapshot_document: SnapshotDocument) -> Result<Self, Self::Error> {
         let has_history = snapshot_document.contribution_history.is_some();
         let has_colors = snapshot_document.language_colors.is_some();
+        let has_owned = snapshot_document.owned_repositories.is_some();
         match snapshot_document.schema_version {
             SnapshotVersion::V1 if has_history => {
                 return Err(
@@ -374,9 +390,9 @@ impl TryFrom<SnapshotDocument> for AccountSnapshot {
                         .to_owned(),
                 );
             }
-            SnapshotVersion::V2 | SnapshotVersion::V3 if !has_history => {
+            SnapshotVersion::V2 | SnapshotVersion::V3 | SnapshotVersion::V4 if !has_history => {
                 return Err(
-                    "missing contribution_history in snapshot versions 2 and 3; \
+                    "missing contribution_history in snapshot versions 2 through 4; \
                      supply dated observations"
                         .to_owned(),
                 );
@@ -386,8 +402,20 @@ impl TryFrom<SnapshotDocument> for AccountSnapshot {
                      use version 3 for language colors"
                     .to_owned());
             }
-            SnapshotVersion::V3 if !has_colors => {
-                return Err("missing language_colors in snapshot version 3; \
+            SnapshotVersion::V3 | SnapshotVersion::V4 if !has_colors => {
+                return Err("missing language_colors in snapshot versions 3 and 4; \
+                     collect the snapshot again"
+                    .to_owned());
+            }
+            SnapshotVersion::V1 | SnapshotVersion::V2 | SnapshotVersion::V3 if has_owned => {
+                return Err(
+                    "owned_repositories is not a field before snapshot version 4; \
+                     use version 4 for owned repositories"
+                        .to_owned(),
+                );
+            }
+            SnapshotVersion::V4 if !has_owned => {
+                return Err("missing owned_repositories in snapshot version 4; \
                      collect the snapshot again"
                     .to_owned());
             }
@@ -398,13 +426,16 @@ impl TryFrom<SnapshotDocument> for AccountSnapshot {
             repositories: snapshot_document.repositories,
             contribution_history: snapshot_document.contribution_history,
             language_colors: snapshot_document.language_colors,
+            owned_repositories: snapshot_document.owned_repositories,
         })
     }
 }
 
 impl From<AccountSnapshot> for SnapshotDocument {
     fn from(account_snapshot: AccountSnapshot) -> Self {
-        let schema_version = if account_snapshot.language_colors.is_some() {
+        let schema_version = if account_snapshot.owned_repositories.is_some() {
+            SnapshotVersion::V4
+        } else if account_snapshot.language_colors.is_some() {
             SnapshotVersion::V3
         } else if account_snapshot.contribution_history.is_some() {
             SnapshotVersion::V2
@@ -417,6 +448,7 @@ impl From<AccountSnapshot> for SnapshotDocument {
             repositories: account_snapshot.repositories,
             contribution_history: account_snapshot.contribution_history,
             language_colors: account_snapshot.language_colors,
+            owned_repositories: account_snapshot.owned_repositories,
         }
     }
 }
@@ -447,6 +479,7 @@ enum SnapshotVersion {
     V1 = 1,
     V2 = 2,
     V3 = 3,
+    V4 = 4,
 }
 
 impl TryFrom<u32> for SnapshotVersion {
@@ -459,6 +492,8 @@ impl TryFrom<u32> for SnapshotVersion {
             Ok(Self::V2)
         } else if schema_version == Self::V3 as u32 {
             Ok(Self::V3)
+        } else if schema_version == Self::V4 as u32 {
+            Ok(Self::V4)
         } else {
             Err(format!(
                 "unsupported snapshot schema version {schema_version}; use a reader supporting that version"

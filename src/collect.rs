@@ -121,6 +121,7 @@ pub fn collect_account_snapshot(
             github, login, created_on, today,
         )?),
         language_colors: Some(language_colors),
+        owned_repositories: None,
     };
     summarize_contributions(&account_snapshot).map_err(CollectionError::InvalidHistory)?;
     calculate_language_shares(&account_snapshot).map_err(CollectionError::ConflictingRepository)?;
