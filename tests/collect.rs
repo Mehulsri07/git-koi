@@ -7,7 +7,8 @@ use chrono::{Datelike, Days, NaiveDate, Weekday};
 use git_koi::coat::KoiBody;
 use git_koi::collect::{CollectionError, GraphqlClient, collect_account_snapshot};
 use git_koi::history::{
-    ContributionHistoryError, LanguageColor, calculate_language_shares, summarize_contributions,
+    ContributionHistoryError, LanguageColor, OwnedRepository, calculate_language_shares,
+    summarize_contributions,
 };
 use git_koi::koi::derive_koi_development;
 use git_koi::render::render_koi;
@@ -54,6 +55,81 @@ fn collected_snapshot_covers_every_page_and_day_and_renders() {
             .chunks(4)
             .any(|pixel| pixel[3] != 0)
     );
+}
+
+#[test]
+fn collection_records_owner_commits_for_owned_public_repositories() {
+    let mut github = RecordedGitHub::new();
+    let mut fork = owned_node(30, 5);
+    fork["isFork"] = json!(true);
+    let mut private = owned_node(40, 9);
+    private["visibility"] = json!("PRIVATE");
+    github.owned_pages = vec![repository_page(
+        vec![owned_node(10, 7), fork, private, owned_node(20, 95)],
+        None,
+    )];
+    let account_snapshot = collect_account_snapshot(&github, LOGIN, date("2026-01-03")).unwrap();
+    assert_eq!(
+        account_snapshot.owned_repositories,
+        Some(vec![
+            OwnedRepository {
+                repository_id: 10,
+                owner_commit_count: 7
+            },
+            OwnedRepository {
+                repository_id: 20,
+                owner_commit_count: 95
+            },
+        ])
+    );
+}
+
+#[test]
+fn an_owned_repository_without_a_default_branch_has_no_commits() {
+    let mut github = RecordedGitHub::new();
+    let mut empty = owned_node(10, 0);
+    empty["defaultBranchRef"] = Value::Null;
+    github.owned_pages = vec![repository_page(vec![empty], None)];
+    let account_snapshot = collect_account_snapshot(&github, LOGIN, date("2026-01-03")).unwrap();
+    assert_eq!(
+        account_snapshot.owned_repositories,
+        Some(vec![OwnedRepository {
+            repository_id: 10,
+            owner_commit_count: 0
+        }])
+    );
+}
+
+#[test]
+fn contributed_repositories_are_not_owned() {
+    let github = RecordedGitHub::new();
+    let account_snapshot = collect_account_snapshot(&github, LOGIN, date("2026-01-03")).unwrap();
+    let owned = account_snapshot.owned_repositories.unwrap();
+    assert!(owned.iter().all(|repository| repository.repository_id != 4));
+    assert_eq!(owned.len(), 2);
+}
+
+#[test]
+fn the_owner_commit_query_filters_by_the_users_node_id() {
+    let github = RecordedGitHub::new();
+    collect_account_snapshot(&github, LOGIN, date("2026-01-03")).unwrap();
+    let queries = github.queries.borrow();
+    let owned_requests: Vec<_> = queries
+        .iter()
+        .filter(|(query, _)| query.contains("repositories(") && !query.contains("ContributedTo"))
+        .collect();
+    assert!(!owned_requests.is_empty());
+    for (query, variables) in owned_requests {
+        assert_eq!(variables["userId"], "U_synthetic");
+        assert!(query.contains("$userId: ID!"));
+    }
+    for (query, variables) in queries
+        .iter()
+        .filter(|(query, _)| query.contains("ContributedTo"))
+    {
+        assert!(!variables.contains_key("userId"));
+        assert!(!query.contains("history"));
+    }
 }
 
 #[test]
@@ -124,7 +200,7 @@ fn the_day_in_progress_is_left_out_even_when_github_reports_it() {
 #[test]
 fn an_account_created_today_has_an_empty_history_through_yesterday() {
     let github = RecordedGitHub {
-        account: json!({ "databaseId": 4242, "createdAt": "2026-01-03T08:00:00Z" }),
+        account: json!({ "id": "U_synthetic", "databaseId": 4242, "createdAt": "2026-01-03T08:00:00Z" }),
         ..RecordedGitHub::new()
     };
     let account_snapshot = collect_account_snapshot(&github, LOGIN, date("2026-01-03")).unwrap();
@@ -277,12 +353,13 @@ struct RecordedGitHub {
     contributed_pages: Vec<Value>,
     calendar: fn(NaiveDate, NaiveDate) -> Result<Value, CollectionError>,
     requests: RefCell<Vec<BTreeMap<String, String>>>,
+    queries: RefCell<Vec<(String, BTreeMap<String, String>)>>,
 }
 
 impl RecordedGitHub {
     fn new() -> Self {
         Self {
-            account: json!({ "databaseId": 4242, "createdAt": "2024-11-20T10:15:00Z" }),
+            account: json!({ "id": "U_synthetic", "databaseId": 4242, "createdAt": "2024-11-20T10:15:00Z" }),
             owned_pages: vec![
                 repository_page(
                     vec![
@@ -296,6 +373,7 @@ impl RecordedGitHub {
             contributed_pages: vec![repository_page(vec![repository_node(4, false, None)], None)],
             calendar: |from, to| Ok(calendar_response(from, to, |_| true)),
             requests: RefCell::new(Vec::new()),
+            queries: RefCell::new(Vec::new()),
         }
     }
 }
@@ -307,6 +385,9 @@ impl GraphqlClient for RecordedGitHub {
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect();
         self.requests.borrow_mut().push(variables.clone());
+        self.queries
+            .borrow_mut()
+            .push((query.to_owned(), variables.clone()));
         if query.contains("contributionsCollection") {
             let window_date = |name: &str| date(&variables[name][..10]);
             return (self.calendar)(window_date("from"), window_date("to"));
@@ -336,7 +417,15 @@ fn repository_node(repository_id: u64, is_fork: bool, language: Option<&str>) ->
         "visibility": "PUBLIC",
         "isFork": is_fork,
         "primaryLanguage": language.map(|name| json!({ "name": name, "color": language_color(name) })),
+        "defaultBranchRef": { "target": { "history": { "totalCount": 1 } } },
     })
+}
+
+/// An owned repository node whose default branch holds `commits` of the owner's commits.
+fn owned_node(repository_id: u64, commits: u64) -> Value {
+    let mut node = repository_node(repository_id, false, None);
+    node["defaultBranchRef"]["target"]["history"]["totalCount"] = json!(commits);
+    node
 }
 
 fn repository_page(nodes: Vec<Value>, next_cursor: Option<&str>) -> Value {

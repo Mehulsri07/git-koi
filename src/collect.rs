@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use crate::history::{
     AccountSnapshot, ConflictingRepository, ContributionDay, ContributionHistory,
-    ContributionHistoryError, LanguageColor, RepositoryObservation, RepositoryVisibility,
-    calculate_language_shares, summarize_contributions,
+    ContributionHistoryError, LanguageColor, OwnedRepository, RepositoryObservation,
+    RepositoryVisibility, calculate_language_shares, summarize_contributions,
 };
 
 /// Runs one GitHub GraphQL query with string variables and returns its `data` object.
@@ -59,14 +59,20 @@ impl GraphqlClient for GhCli {
 }
 
 const ACCOUNT_QUERY: &str =
-    "query($login: String!) { user(login: $login) { databaseId createdAt } }";
+    "query($login: String!) { user(login: $login) { id databaseId createdAt } }";
 const REPOSITORY_FIELDS: &str = "nodes { databaseId visibility isFork primaryLanguage { name color } } pageInfo { hasNextPage endCursor }";
+/// Owned repositories also count the owner's commits on the default branch; a
+/// repository without a default branch (empty) has `defaultBranchRef: null`.
+const OWNED_REPOSITORY_FIELDS: &str = "nodes { databaseId visibility isFork primaryLanguage { name color } \
+    defaultBranchRef { target { ... on Commit { history(author: { id: $userId }) { totalCount } } } } } \
+    pageInfo { hasNextPage endCursor }";
 const CALENDAR_QUERY: &str = "query($login: String!, $from: DateTime!, $to: DateTime!) { \
     user(login: $login) { contributionsCollection(from: $from, to: $to) { \
     contributionCalendar { weeks { contributionDays { date contributionCount } } } } } }";
 
 /// Collect one account's public snapshot: its public owned repositories, the public
-/// repositories GitHub counts it as contributing to, GitHub's color for each of their
+/// repositories GitHub counts it as contributing to, the account's own commit count on
+/// each public non-fork owned repository, GitHub's color for each of their
 /// languages, and daily contribution counts from the day it was created through the
 /// latest date GitHub reports.
 ///
@@ -90,6 +96,7 @@ pub fn collect_account_snapshot(
         .filter(|user| !user.is_null())
         .ok_or_else(|| CollectionError::AccountNotFound(login.to_owned()))?;
     let account_id = read_u64(user, "databaseId")?;
+    let user_node_id = read_str(user, "id")?;
     let created_on = DateTime::parse_from_rfc3339(read_str(user, "createdAt")?)
         .map_err(|parse_error| {
             CollectionError::UnexpectedResponse(format!(
@@ -98,22 +105,27 @@ pub fn collect_account_snapshot(
         })?
         .date_naive();
     let mut language_colors = BTreeMap::new();
-    let mut repositories = collect_repositories(
+    let (mut repositories, owned_repositories) = collect_repositories(
         github,
         login,
+        Some(user_node_id),
         &mut language_colors,
         "repositories",
         "repositories(first: 100, after: $cursor, ownerAffiliations: [OWNER], privacy: PUBLIC)",
     )?;
-    repositories.extend(collect_repositories(
-        github,
-        login,
-        &mut language_colors,
-        "repositoriesContributedTo",
-        "repositoriesContributedTo(first: 100, after: $cursor, privacy: PUBLIC, \
+    repositories.extend(
+        collect_repositories(
+            github,
+            login,
+            None,
+            &mut language_colors,
+            "repositoriesContributedTo",
+            "repositoriesContributedTo(first: 100, after: $cursor, privacy: PUBLIC, \
          includeUserRepositories: false, \
          contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, PULL_REQUEST_REVIEW, REPOSITORY])",
-    )?);
+        )?
+        .0,
+    );
     let account_snapshot = AccountSnapshot {
         account_id,
         repositories,
@@ -121,7 +133,7 @@ pub fn collect_account_snapshot(
             github, login, created_on, today,
         )?),
         language_colors: Some(language_colors),
-        owned_repositories: None,
+        owned_repositories: Some(owned_repositories),
     };
     summarize_contributions(&account_snapshot).map_err(CollectionError::InvalidHistory)?;
     calculate_language_shares(&account_snapshot).map_err(CollectionError::ConflictingRepository)?;
@@ -129,32 +141,55 @@ pub fn collect_account_snapshot(
 }
 
 /// Follow every page of one repository connection on the user, recording each primary
-/// language's color as it goes.
+/// language's color as it goes. With `owner_node_id` the connection is the owned one:
+/// the query also counts that user's commits on each default branch, and every public
+/// non-fork repository is returned as an `OwnedRepository` in the order GitHub gave it.
+/// Without it the second list is empty.
 fn collect_repositories(
     github: &impl GraphqlClient,
     login: &str,
+    owner_node_id: Option<&str>,
     language_colors: &mut BTreeMap<String, Option<LanguageColor>>,
     connection_name: &str,
     connection_call: &str,
-) -> Result<Vec<RepositoryObservation>, CollectionError> {
+) -> Result<(Vec<RepositoryObservation>, Vec<OwnedRepository>), CollectionError> {
+    let (user_id_declaration, fields) = if owner_node_id.is_some() {
+        (", $userId: ID!", OWNED_REPOSITORY_FIELDS)
+    } else {
+        ("", REPOSITORY_FIELDS)
+    };
     let query = format!(
-        "query($login: String!, $cursor: String) {{ user(login: $login) {{ {connection_call} {{ {REPOSITORY_FIELDS} }} }} }}"
+        "query($login: String!, $cursor: String{user_id_declaration}) {{ user(login: $login) {{ {connection_call} {{ {fields} }} }} }}"
     );
     let mut repositories = Vec::new();
+    let mut owned_repositories = Vec::new();
     let mut page_cursor: Option<String> = None;
     loop {
         let mut variables = vec![("login", login)];
+        if let Some(owner_node_id) = owner_node_id {
+            variables.push(("userId", owner_node_id));
+        }
         if let Some(page_cursor) = &page_cursor {
             variables.push(("cursor", page_cursor.as_str()));
         }
         let page_data = github.run_query(&query, &variables)?;
         let connection = read_field(read_field(&page_data, "user")?, connection_name)?;
         for repository_node in read_array(connection, "nodes")? {
-            repositories.push(read_repository(repository_node, language_colors)?);
+            let repository = read_repository(repository_node, language_colors)?;
+            if owner_node_id.is_some()
+                && repository.visibility == RepositoryVisibility::Public
+                && !repository.is_fork
+            {
+                owned_repositories.push(OwnedRepository {
+                    repository_id: repository.repository_id,
+                    owner_commit_count: read_owner_commit_count(repository_node)?,
+                });
+            }
+            repositories.push(repository);
         }
         let page_info = read_field(connection, "pageInfo")?;
         if !read_bool(page_info, "hasNextPage")? {
-            return Ok(repositories);
+            return Ok((repositories, owned_repositories));
         }
         let next_cursor = read_str(page_info, "endCursor")?.to_owned();
         if page_cursor.as_deref() == Some(next_cursor.as_str()) {
@@ -163,6 +198,17 @@ fn collect_repositories(
             )));
         }
         page_cursor = Some(next_cursor);
+    }
+}
+
+/// The owner's commit count on the default branch; an empty repository has none.
+fn read_owner_commit_count(repository_node: &Value) -> Result<u64, CollectionError> {
+    match read_field(repository_node, "defaultBranchRef")? {
+        Value::Null => Ok(0),
+        default_branch => read_u64(
+            read_field(read_field(default_branch, "target")?, "history")?,
+            "totalCount",
+        ),
     }
 }
 
