@@ -251,7 +251,7 @@ fn pads_never_overlap_or_leave_the_pond() {
             assert!(pad.center[0] + radius <= f64::from(POND_WIDTH_PIXELS));
             assert!(pad.center[1] - radius >= 0.0);
             assert!(pad.center[1] + radius <= f64::from(POND_HEIGHT_PIXELS));
-            assert!((0.0..6.283).contains(&pad.notch_radians));
+            assert!((0.0..std::f64::consts::TAU).contains(&pad.notch_radians));
         }
         for (index, first) in layout.pads.iter().enumerate() {
             for second in &layout.pads[index + 1..] {
