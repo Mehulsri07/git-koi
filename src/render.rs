@@ -206,6 +206,11 @@ fn render_pose(
         koi_anatomy,
         koi_coat: &koi_coat,
     };
+    let body_grid = SegmentGrid::new(&body_spine);
+    let fin_grids: Vec<SegmentGrid> = fin_curves
+        .iter()
+        .map(|fin_curve| SegmentGrid::new(fin_curve))
+        .collect();
     let mut rgba_pixels = Vec::with_capacity((FRAME_WIDTH_PIXELS * FRAME_HEIGHT_PIXELS) as usize);
     for pixel_y in 0..FRAME_HEIGHT_PIXELS {
         for pixel_x in 0..FRAME_WIDTH_PIXELS {
@@ -220,8 +225,8 @@ fn render_pose(
             });
             rgba_pixels.push(if is_inside_bounds {
                 sample_koi(
-                    &body_spine,
-                    &fin_curves,
+                    &body_grid,
+                    &fin_grids,
                     sample_position,
                     [pixel_x, pixel_y],
                     &koi_appearance,
@@ -998,29 +1003,170 @@ fn measure_curve_bounds(
 }
 
 fn sample_koi(
-    body_spine: &[CurvePoint],
-    fin_curves: &[Vec<CurvePoint>],
+    body_grid: &SegmentGrid,
+    fin_grids: &[SegmentGrid],
     sample_position: [f64; 2],
     pixel_position: [u32; 2],
     koi_appearance: &KoiAppearance,
 ) -> [u8; 4] {
-    if let Some(body_sample) = sample_curve(body_spine, sample_position) {
+    if let Some(body_sample) = body_grid.sample(sample_position) {
         return shade_body(&body_sample, pixel_position, koi_appearance);
     }
-    for fin_curve in fin_curves {
-        if let Some(fin_sample) = sample_curve(fin_curve, sample_position) {
+    for fin_grid in fin_grids {
+        if let Some(fin_sample) = fin_grid.sample(sample_position) {
             return shade_fin(&fin_sample, pixel_position, koi_appearance.koi_coat);
         }
     }
     [0; 4]
 }
 
-// Constructed curves contain at least two points and no zero-length segments.
+/// One curve's segment indices, bucketed into a uniform grid of square cells, so a
+/// sample only measures the segments near it.
+///
+/// Each cell is as wide as the curve's largest half width (at least one pixel), and
+/// lists, in ascending order, every segment whose bounding box, grown by one cell, meets
+/// it. Sampling through the grid gives exactly what `sample_curve` gives over the whole
+/// curve. A sample is kept only if its closest segment lies within that sample's half
+/// width, which is at most the largest half width, the cell size; so whenever the full
+/// scan keeps a sample, its closest segment is listed in the sample's cell, and no
+/// listed segment is closer. Both scans run the same arithmetic over segments in
+/// ascending order and keep the first strict minimum, so ties resolve to the lowest
+/// index in both, and the along fraction counts from the segment's index on the whole
+/// curve. When the full scan keeps nothing, the closest listed segment is no closer
+/// than the true closest, so the grid keeps nothing either; an empty cell or a position
+/// off the grid keeps nothing.
+struct SegmentGrid<'a> {
+    curve_points: &'a [CurvePoint],
+    origin: [f64; 2],
+    cell_size_pixels: f64,
+    column_count: usize,
+    row_count: usize,
+    /// Each cell's listed segments are `segment_indices[cell_starts[cell]..cell_starts[cell + 1]]`.
+    cell_starts: Vec<usize>,
+    segment_indices: Vec<usize>,
+}
+
+impl<'a> SegmentGrid<'a> {
+    fn new(curve_points: &'a [CurvePoint]) -> Self {
+        // Covers rounding in the distance and the box arithmetic, which could otherwise
+        // leave a sample at exactly the largest half width just outside its segment's
+        // grown box; listing a few more segments never changes a sample.
+        const ROUNDING_SLACK_PIXELS: f64 = 1e-6;
+        let cell_size_pixels = curve_points
+            .iter()
+            .map(|curve_point| curve_point.half_width_pixels)
+            .fold(1.0, f64::max);
+        let growth_pixels = cell_size_pixels + ROUNDING_SLACK_PIXELS;
+        let mut origin = [f64::INFINITY; 2];
+        let mut far_corner = [f64::NEG_INFINITY; 2];
+        for curve_point in curve_points {
+            for axis_index in 0..2 {
+                origin[axis_index] =
+                    origin[axis_index].min(curve_point.position[axis_index] - growth_pixels);
+                far_corner[axis_index] =
+                    far_corner[axis_index].max(curve_point.position[axis_index] + growth_pixels);
+            }
+        }
+        let locate_line = |axis_index: usize, coordinate: f64| {
+            ((coordinate - origin[axis_index]) / cell_size_pixels).floor() as usize
+        };
+        let column_count = locate_line(0, far_corner[0]) + 1;
+        let row_count = locate_line(1, far_corner[1]) + 1;
+        // The cells each segment's grown box meets, as inclusive column and row ranges.
+        let segment_cells: Vec<[[usize; 2]; 2]> = curve_points
+            .windows(2)
+            .map(|end_points| {
+                [0, 1].map(|axis_index| {
+                    let [start_coordinate, end_coordinate] = [end_points[0], end_points[1]]
+                        .map(|curve_point| curve_point.position[axis_index]);
+                    [
+                        locate_line(
+                            axis_index,
+                            start_coordinate.min(end_coordinate) - growth_pixels,
+                        ),
+                        locate_line(
+                            axis_index,
+                            start_coordinate.max(end_coordinate) + growth_pixels,
+                        ),
+                    ]
+                })
+            })
+            .collect();
+        let mut cell_starts = vec![0; column_count * row_count + 1];
+        for [[first_column, last_column], [first_row, last_row]] in &segment_cells {
+            for row in *first_row..=*last_row {
+                for column in *first_column..=*last_column {
+                    cell_starts[row * column_count + column + 1] += 1;
+                }
+            }
+        }
+        for cell_index in 1..cell_starts.len() {
+            cell_starts[cell_index] += cell_starts[cell_index - 1];
+        }
+        let mut next_slots = cell_starts.clone();
+        let mut segment_indices = vec![0; cell_starts[cell_starts.len() - 1]];
+        // Segments go in ascending order, so every cell lists them ascending.
+        for (segment_index, [[first_column, last_column], [first_row, last_row]]) in
+            segment_cells.iter().enumerate()
+        {
+            for row in *first_row..=*last_row {
+                for column in *first_column..=*last_column {
+                    let next_slot = &mut next_slots[row * column_count + column];
+                    segment_indices[*next_slot] = segment_index;
+                    *next_slot += 1;
+                }
+            }
+        }
+        Self {
+            curve_points,
+            origin,
+            cell_size_pixels,
+            column_count,
+            row_count,
+            cell_starts,
+            segment_indices,
+        }
+    }
+
+    fn sample(&self, sample_position: [f64; 2]) -> Option<CurveSample> {
+        let [column, row] = [0, 1].map(|axis_index| {
+            ((sample_position[axis_index] - self.origin[axis_index]) / self.cell_size_pixels)
+                .floor()
+        });
+        if !(0.0..self.column_count as f64).contains(&column)
+            || !(0.0..self.row_count as f64).contains(&row)
+        {
+            return None;
+        }
+        let cell_index = row as usize * self.column_count + column as usize;
+        let listed_segments =
+            &self.segment_indices[self.cell_starts[cell_index]..self.cell_starts[cell_index + 1]];
+        sample_segments(
+            self.curve_points,
+            listed_segments.iter().copied(),
+            sample_position,
+        )
+    }
+}
+
+/// Sample the closest point on the whole curve, scanning every segment.
+#[cfg(test)]
 fn sample_curve(curve_points: &[CurvePoint], sample_position: [f64; 2]) -> Option<CurveSample> {
+    sample_segments(curve_points, 0..curve_points.len() - 1, sample_position)
+}
+
+// Constructed curves contain at least two points and no zero-length segments.
+// Segment indices must ascend; the first strict minimum wins.
+fn sample_segments(
+    curve_points: &[CurvePoint],
+    segment_indices: impl Iterator<Item = usize>,
+    sample_position: [f64; 2],
+) -> Option<CurveSample> {
     let mut closest_sample = None;
     let mut closest_distance_pixels = f64::INFINITY;
-    for (segment_index, end_points) in curve_points.windows(2).enumerate() {
-        let [start_point, end_point] = [end_points[0], end_points[1]];
+    for segment_index in segment_indices {
+        let [start_point, end_point] =
+            [curve_points[segment_index], curve_points[segment_index + 1]];
         let segment_x = end_point.position[0] - start_point.position[0];
         let segment_y = end_point.position[1] - start_point.position[1];
         let offset_x = sample_position[0] - start_point.position[0];
@@ -1300,5 +1446,58 @@ mod tests {
         let half_open = count_painted(&paint_mouth_alone(KoiBody::White, 0.5));
         let wide_open = count_painted(&paint_mouth_alone(KoiBody::White, 1.0));
         assert!(0 < half_open && half_open < wide_open);
+    }
+
+    fn assert_same_sample(grid_sample: Option<CurveSample>, scanned_sample: Option<CurveSample>) {
+        let to_bits = |curve_sample: CurveSample| {
+            [
+                curve_sample.along_fraction,
+                curve_sample.lateral_pixels,
+                curve_sample.distance_pixels,
+                curve_sample.half_width_pixels,
+                curve_sample.normal_direction[0],
+                curve_sample.normal_direction[1],
+            ]
+            .map(f64::to_bits)
+        };
+        assert_eq!(grid_sample.map(to_bits), scanned_sample.map(to_bits));
+    }
+
+    #[test]
+    fn grid_sampling_matches_scanning_every_segment() {
+        for total_contributions in [14, 1_500, 12_750, 100_000] {
+            let koi_anatomy = calculate_anatomy(total_contributions);
+            for (behavior, frame_index) in [
+                (Behavior::Cruise, 0),
+                (Behavior::Rest, 7),
+                (Behavior::Dart, 33),
+            ] {
+                let swim_pose = calculate_swim_pose(behavior, frame_index);
+                let body_spine = build_spine(&koi_anatomy, &swim_pose);
+                let fin_curves = build_fins(&body_spine, &koi_anatomy, &swim_pose);
+                for curve_points in std::iter::once(&body_spine).chain(&fin_curves) {
+                    let segment_grid = SegmentGrid::new(curve_points);
+                    let [min_corner, max_corner] = measure_curve_bounds(curve_points, &[]);
+                    // Half-pixel steps, off the pixel centers, a little past the curve's box.
+                    let step_range = |axis_index: usize| {
+                        let first_step = ((min_corner[axis_index] - 3.0) * 2.0).floor() as i32;
+                        let last_step = ((max_corner[axis_index] + 3.0) * 2.0).ceil() as i32;
+                        first_step..=last_step
+                    };
+                    for step_y in step_range(1) {
+                        for step_x in step_range(0) {
+                            let sample_position = [
+                                f64::from(step_x) * 0.5 + 0.13,
+                                f64::from(step_y) * 0.5 + 0.13,
+                            ];
+                            assert_same_sample(
+                                segment_grid.sample(sample_position),
+                                sample_curve(curve_points, sample_position),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
