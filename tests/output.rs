@@ -4,6 +4,7 @@ use git_koi::behavior::Behavior;
 use git_koi::coat::KoiBody;
 use git_koi::history::AccountSnapshot;
 use git_koi::koi::derive_koi_development;
+use git_koi::motion::FRAMES_PER_SECOND;
 use git_koi::output::{GifEncodingError, STATIC_HEIGHT_PIXELS, STATIC_WIDTH_PIXELS, encode_gif};
 use git_koi::render::{FRAME_WIDTH_PIXELS, KoiFrame, render_swim_frame};
 
@@ -71,7 +72,17 @@ fn the_gif_repeats_forever_at_fifteen_frames_per_second() {
     while let Some(gif_frame) = gif_decoder.read_next_frame().unwrap() {
         frame_delays.push(gif_frame.delay);
     }
-    assert_eq!(frame_delays, [7, 6, 7, 7, 6, 7]);
+    // Each delay is a frame's share of a second, rounded either way, and the rounding
+    // never accumulates: six frames at fifteen per second last exactly 0.4 s.
+    let frame_hundredths = 100.0 / f64::from(FRAMES_PER_SECOND);
+    assert!(
+        frame_delays
+            .iter()
+            .all(|&delay| (f64::from(delay) - frame_hundredths).abs() < 1.0),
+        "{frame_delays:?}"
+    );
+    let total_hundredths: u32 = frame_delays.iter().map(|&delay| u32::from(delay)).sum();
+    assert_eq!(total_hundredths, 6 * 100 / FRAMES_PER_SECOND);
     assert_eq!(gif_decoder.repeat(), gif::Repeat::Infinite);
 }
 

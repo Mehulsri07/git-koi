@@ -386,8 +386,7 @@ fn swimming_keeps_the_whole_fish_inside_the_frame() {
 }
 
 #[test]
-fn surface_feeding_draws_pellets_that_rest_does_not() {
-    const PELLET_COLOR: [u8; 4] = [228, 166, 114, 255];
+fn surface_feeding_draws_colors_that_rest_does_not() {
     let koi_development = develop_with_languages(1_500, FOUR_LANGUAGE_MIX);
     let colors_of = |behavior| {
         (0..frame_count(behavior))
@@ -402,8 +401,9 @@ fn surface_feeding_draws_pellets_that_rest_does_not() {
             })
             .collect::<BTreeSet<_>>()
     };
-    assert!(colors_of(Behavior::SurfaceFeeding).contains(&PELLET_COLOR));
-    assert!(!colors_of(Behavior::Rest).contains(&PELLET_COLOR));
+    let feeding_colors = colors_of(Behavior::SurfaceFeeding);
+    let rest_colors = colors_of(Behavior::Rest);
+    assert!(feeding_colors.difference(&rest_colors).next().is_some());
 }
 
 #[test]

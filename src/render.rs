@@ -328,6 +328,9 @@ fn paint_mouth(
     }
 }
 
+/// Food pellets: a bright pixel with a darker one to its right.
+const PELLET_COLORS: [[u8; 4]; 2] = [[228, 166, 114, 255], [184, 111, 80, 255]];
+
 /// Surface feeding: ripple rings spreading from the mouth and food pellets drifting in
 /// to it, drawn on the water around the koi. Where the frame edge leaves too little
 /// room, both shrink toward the mouth instead of running off the edge.
@@ -348,7 +351,6 @@ fn paint_feeding(
     const PELLET_WANDER_PIXELS: f64 = 9.0;
     // Pellets vanish just before they reach the mouth.
     const PELLET_EATEN_LIFE: f64 = 0.92;
-    const PELLET_COLORS: [[u8; 4]; 2] = [[228, 166, 114, 255], [184, 111, 80, 255]];
     // A clear pixel between the extras and the frame edge, plus rounding.
     const EDGE_MARGIN_PIXELS: f64 = 2.0;
     let frame_sizes = [
@@ -1284,10 +1286,12 @@ mod tests {
     #[test]
     fn the_mouth_opens_as_a_body_colored_rim_around_a_dark_opening() {
         assert_eq!(count_painted(&paint_mouth_alone(KoiBody::White, 0.1)), 0);
-        for (koi_body, rim_color) in [
-            (KoiBody::White, [192, 203, 220, 255]),
-            (KoiBody::Black, [58, 68, 102, 255]),
-        ] {
+        let [white_rim, black_rim] =
+            [KoiBody::White, KoiBody::Black].map(KoiBody::select_mouth_rim_color);
+        assert_ne!(white_rim, black_rim);
+        for koi_body in [KoiBody::White, KoiBody::Black] {
+            let rim_color = koi_body.select_mouth_rim_color();
+            assert_ne!(rim_color, OUTLINE_COLOR, "{koi_body:?}");
             let open_mouth = paint_mouth_alone(koi_body, 1.0);
             assert_eq!(center_pixel(&open_mouth), OUTLINE_COLOR);
             assert!(open_mouth.contains(&rim_color), "{koi_body:?}");
@@ -1300,5 +1304,25 @@ mod tests {
         let half_open = count_painted(&paint_mouth_alone(KoiBody::White, 0.5));
         let wide_open = count_painted(&paint_mouth_alone(KoiBody::White, 1.0));
         assert!(0 < half_open && half_open < wide_open);
+    }
+
+    #[test]
+    fn feeding_paints_both_pellet_colors_around_the_mouth() {
+        let koi_anatomy = calculate_anatomy(1_500);
+        let body_spine = build_spine(&koi_anatomy, &STILL_POSE);
+        let pose_center = calculate_mouth_position(&body_spine);
+        for feeding_phase in [0.0, 0.5] {
+            let mut rgba_pixels = vec![[0; 4]; (FRAME_WIDTH_PIXELS * FRAME_HEIGHT_PIXELS) as usize];
+            paint_feeding(
+                &mut rgba_pixels,
+                &body_spine,
+                &koi_anatomy,
+                pose_center,
+                feeding_phase,
+            );
+            for pellet_color in PELLET_COLORS {
+                assert!(rgba_pixels.contains(&pellet_color), "{feeding_phase}");
+            }
+        }
     }
 }

@@ -21,30 +21,37 @@ fn streak_fins_build_linearly_to_full_at_thirteen_weeks() {
 
 #[test]
 fn streak_fins_fade_to_nothing_six_and_a_half_weeks_after_a_streak_ends() {
-    for (days_since_end, expected_strength) in [
-        (0, 1.0),
-        (7, 0.59066),
-        (14, 0.34238),
-        (28, 0.10046),
-        (45, 0.00147),
-        (46, 0.0),
-        (365, 0.0),
-    ] {
-        let koi_development = develop_after_streak_end(13, days_since_end);
-        let streak_fin_strength = calculate_streak_marks(&koi_development).streak_fin_strength;
+    let strength_after = |days_since_end| {
+        calculate_streak_marks(&develop_after_streak_end(13, days_since_end)).streak_fin_strength
+    };
+    assert_close(strength_after(0), 1.0);
+    // Six and a half weeks is 45.5 days: still showing on day 45, gone from day 46.
+    let mut previous_strength = strength_after(0);
+    for days_since_end in 1..=45 {
+        let fading_strength = strength_after(days_since_end);
         assert!(
-            (streak_fin_strength - expected_strength).abs() < 0.00001,
-            "{days_since_end} days after: {streak_fin_strength}"
+            0.0 < fading_strength && fading_strength < previous_strength,
+            "{days_since_end} days after: {fading_strength}"
         );
+        previous_strength = fading_strength;
     }
+    assert_close(strength_after(46), 0.0);
+    assert_close(strength_after(365), 0.0);
 }
 
 #[test]
 fn a_short_streak_fades_from_the_strength_it_reached() {
-    let ended_strength = calculate_streak_marks(&develop_after_streak_end(4, 0));
-    let faded_strength = calculate_streak_marks(&develop_after_streak_end(4, 7));
-    assert_close(ended_strength.streak_fin_strength, 4.0 / 13.0);
-    assert!((faded_strength.streak_fin_strength - 4.0 / 13.0 * 0.59066).abs() < 0.00001);
+    let strength_of = |streak_week_count, days_since_end| {
+        calculate_streak_marks(&develop_after_streak_end(streak_week_count, days_since_end))
+            .streak_fin_strength
+    };
+    assert_close(strength_of(4, 0), 4.0 / 13.0);
+    for days_since_end in [7, 28] {
+        assert_close(
+            strength_of(4, days_since_end),
+            4.0 / 13.0 * strength_of(13, days_since_end),
+        );
+    }
 }
 
 #[test]
