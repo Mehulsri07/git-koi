@@ -70,7 +70,7 @@ pub enum Bloom {
     White,
     /// The flower of the third most common language.
     Purple,
-    /// The bud of the fourth most common language.
+    /// The bud on the biggest pad of every language ranked fourth or lower.
     Bud,
 }
 
@@ -130,7 +130,9 @@ struct Candidate<'a> {
 /// keeping those with the most owner commits.
 ///
 /// The layout depends only on the snapshot: the same snapshot always gives the
-/// same pond. This operation performs no I/O.
+/// same pond. Adding a size-one repository with the highest ID among size-one
+/// pads, so it is placed last, is the only change guaranteed not to move other
+/// pads. This operation performs no I/O.
 pub fn layout_pond(account_snapshot: &AccountSnapshot) -> Result<PondLayout, PondError> {
     let owned_repositories = account_snapshot
         .owned_repositories
@@ -203,7 +205,8 @@ pub fn layout_pond(account_snapshot: &AccountSnapshot) -> Result<PondLayout, Pon
     Ok(PondLayout { pads })
 }
 
-/// Give each of the four most common languages a flower on its biggest pad.
+/// Give the three most common languages a flower, and every other language a
+/// bud, on its biggest pad.
 fn assign_blooms(candidates: &mut [Candidate]) {
     let mut pad_counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut biggest: BTreeMap<&str, (PadSize, u64)> = BTreeMap::new();
@@ -226,8 +229,11 @@ fn assign_blooms(candidates: &mut [Candidate]) {
     languages.sort_by_key(|language| std::cmp::Reverse(language.1));
     let winners: Vec<(u64, Bloom)> = languages
         .iter()
-        .zip(FLOWER_ORDER)
-        .map(|((language, _), bloom)| (biggest[language].1, bloom))
+        .enumerate()
+        .map(|(rank, (language, _))| {
+            let bloom = FLOWER_ORDER[rank.min(FLOWER_ORDER.len() - 1)];
+            (biggest[language].1, bloom)
+        })
         .collect();
     for (repository_id, bloom) in winners {
         if let Some(candidate) = candidates

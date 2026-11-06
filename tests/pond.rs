@@ -211,6 +211,7 @@ fn the_layout_is_the_same_every_time() {
     );
 }
 
+// Covers a size-1 addition placed last (highest id among size-1 pads).
 #[test]
 fn adding_a_repository_keeps_the_other_pads_in_place() {
     let repositories: Vec<_> = (1..=3).map(|id| public(id, Some("Rust"))).collect();
@@ -263,4 +264,45 @@ fn pads_never_overlap_or_leave_the_pond() {
             }
         }
     }
+}
+
+#[test]
+fn every_language_past_the_third_gets_a_bud_on_its_biggest_pad() {
+    // Languages A..F with 3,3,2,2,1,1 pads; each language's first pad is its biggest.
+    let counts = [("A", 3), ("B", 3), ("C", 2), ("D", 2), ("E", 1), ("F", 1)];
+    let mut repositories = Vec::new();
+    let mut owned_repositories = Vec::new();
+    let mut biggest = Vec::new();
+    let mut id = 0;
+    for (language, count) in counts {
+        for index in 0..count {
+            id += 1;
+            if index == 0 {
+                biggest.push(id);
+            }
+            repositories.push(public(id, Some(language)));
+            owned_repositories.push(owned(id, if index == 0 { 30 } else { 1 }));
+        }
+    }
+    let layout = layout_pond(&snapshot(4, repositories, Some(owned_repositories))).unwrap();
+    let bloom_of = |id: u64| {
+        layout
+            .pads
+            .iter()
+            .find(|pad| pad.repository_id == id)
+            .unwrap()
+            .bloom
+    };
+    assert_eq!(bloom_of(biggest[0]), Some(Bloom::Pink));
+    assert_eq!(bloom_of(biggest[1]), Some(Bloom::White));
+    assert_eq!(bloom_of(biggest[2]), Some(Bloom::Purple));
+    for id in &biggest[3..] {
+        assert_eq!(bloom_of(*id), Some(Bloom::Bud));
+    }
+    let buds = layout
+        .pads
+        .iter()
+        .filter(|pad| pad.bloom == Some(Bloom::Bud))
+        .count();
+    assert_eq!(buds, 3);
 }
