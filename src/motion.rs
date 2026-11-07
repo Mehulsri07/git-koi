@@ -216,11 +216,50 @@ pub fn frame_count(behavior: Behavior) -> u32 {
 pub fn calculate_swim_pose(behavior: Behavior, frame_index: u32) -> SwimPose {
     let loop_frame_count = frame_count(behavior);
     let loop_frame = frame_index % loop_frame_count;
-    let drive = calculate_drive(behavior, loop_frame);
+    let drive = calculate_drive(behavior, f64::from(loop_frame));
     let trailing_drive = calculate_drive(
         behavior,
-        (loop_frame + loop_frame_count - SIDE_FIN_TRAIL_FRAMES) % loop_frame_count,
+        f64::from((loop_frame + loop_frame_count - SIDE_FIN_TRAIL_FRAMES) % loop_frame_count),
     );
+    compose_pose(&drive, &trailing_drive)
+}
+
+/// A frame number wrapped into the loop, from zero up to its frame count.
+fn wrap_frame(frame: f64, loop_frame_count: f64) -> f64 {
+    let loop_frame = frame.rem_euclid(loop_frame_count);
+    // A tiny negative frame can round up to the frame count itself.
+    if loop_frame < loop_frame_count {
+        loop_frame
+    } else {
+        0.0
+    }
+}
+
+/// How fast a freely swimming koi wants to go at a frame, as a share of its behavior's
+/// mean speed. Darting speeds up after each burst of the dart stroke and slows through
+/// the glide, as on its laps, with the swing toned down by DART_FREE_SPEED_SWING so the
+/// fastest bursts stay steerable; every other behavior keeps a steady speed.
+pub(crate) fn calculate_free_speed_share(behavior: Behavior, frame: f64) -> f64 {
+    const DART_FREE_SPEED_SWING: f64 = 0.5;
+    match behavior {
+        Behavior::Dart => {
+            let style = &DART_STYLE;
+            let loop_frame = wrap_frame(frame, f64::from(style.loop_frame_count));
+            // A beat's mean over its cycle is its share times the mean of a half sine.
+            let mean_speed =
+                style.glide_speed + style.stroke_speed_gain * style.stroke_share * 2.0 / PI;
+            let speed = style.glide_speed
+                + style.stroke_speed_gain
+                    * style.calculate_stroke(loop_frame - style.speed_lag_frames);
+            1.0 + DART_FREE_SPEED_SWING * (speed / mean_speed - 1.0)
+        }
+        _ => 1.0,
+    }
+}
+
+/// The tail, fin trail, pelvic fins, and whiskers follow a frame's drive the same way
+/// for every behavior; the trailing drive is SIDE_FIN_TRAIL_FRAMES earlier.
+fn compose_pose(drive: &Drive, trailing_drive: &Drive) -> SwimPose {
     let tail_bend = TAIL_BEND_PER_WAVE_STRENGTH
         * drive.wave_strength
         * (drive.wave_phase_radians - TAIL_BEND_LAG_RADIANS).sin();
@@ -273,15 +312,16 @@ impl Drive {
     }
 }
 
-fn calculate_drive(behavior: Behavior, loop_frame: u32) -> Drive {
+/// The drive at a frame of the behavior's loop, from zero up to its frame count. Loops
+/// render whole frames; a freely swimming koi passes fractional ones.
+fn calculate_drive(behavior: Behavior, loop_frame: f64) -> Drive {
     match behavior {
         Behavior::Cruise => CRUISE_STYLE.calculate_drive(loop_frame),
         Behavior::Dart => DART_STYLE.calculate_drive(loop_frame),
         Behavior::Rest => calculate_rest_drive(loop_frame, REST_DEPTH),
         Behavior::SurfaceFeeding => Drive {
             feeding_phase: Some(
-                (FEEDING_CYCLES_PER_LOOP * f64::from(loop_frame) / f64::from(REST_FRAME_COUNT))
-                    .fract(),
+                (FEEDING_CYCLES_PER_LOOP * loop_frame / f64::from(REST_FRAME_COUNT)).fract(),
             ),
             ..calculate_rest_drive(loop_frame, 0.0)
         },
@@ -291,7 +331,7 @@ fn calculate_drive(behavior: Behavior, loop_frame: u32) -> Drive {
 
 /// Hovers in place at the given depth, swinging and drifting slowly, with two slow
 /// beats and glides and gently sculling side fins.
-fn calculate_rest_drive(loop_frame: u32, depth: f64) -> Drive {
+fn calculate_rest_drive(loop_frame: f64, depth: f64) -> Drive {
     const STROKE_FRAME_COUNT: f64 = 45.0;
     const STROKE_SHARE: f64 = 0.4;
     const SWING_RADIANS: f64 = 0.1;
@@ -304,7 +344,7 @@ fn calculate_rest_drive(loop_frame: u32, depth: f64) -> Drive {
     const SIDE_FIN_BREATH_RADIANS: f64 = 0.08;
     const SCULL_SWING_RADIANS: f64 = 0.12;
     const SCULL_FRAME_COUNT: f64 = 18.0;
-    let frame = f64::from(loop_frame);
+    let frame = loop_frame;
     let loop_turn = TAU * frame / f64::from(REST_FRAME_COUNT);
     let stroke = calculate_beat(frame, STROKE_FRAME_COUNT, STROKE_SHARE);
     Drive {
@@ -329,7 +369,7 @@ fn calculate_rest_drive(loop_frame: u32, depth: f64) -> Drive {
 
 /// Hovers lower still and barely moves: a slow swing and drift, a breathing wave, and
 /// one flick per loop in which the right fin opens as the left tucks.
-fn calculate_deep_rest_drive(loop_frame: u32) -> Drive {
+fn calculate_deep_rest_drive(loop_frame: f64) -> Drive {
     const SWING_RADIANS: f64 = 0.05;
     const DRIFT_PIXELS: [f64; 2] = [1.5, 1.0];
     const SINK_PIXELS: f64 = 4.0;
@@ -344,7 +384,7 @@ fn calculate_deep_rest_drive(loop_frame: u32) -> Drive {
     // One slow gulp that begins before the flick and ends after it.
     const GULP_START_FRAME: f64 = 66.0;
     const GULP_FRAME_COUNT: f64 = 16.0;
-    let frame = f64::from(loop_frame);
+    let frame = loop_frame;
     let loop_turn = TAU * frame / f64::from(DEEP_REST_FRAME_COUNT);
     let flick_fraction = (frame - FLICK_START_FRAME) / FLICK_FRAME_COUNT;
     let flick = if (0.0..=1.0).contains(&flick_fraction) {
@@ -398,7 +438,7 @@ impl LapStyle {
         calculate_beat(frame, self.stroke_frame_count, self.stroke_share)
     }
 
-    fn calculate_drive(&self, loop_frame: u32) -> Drive {
+    fn calculate_drive(&self, loop_frame: f64) -> Drive {
         let lap_speeds: Vec<f64> = (0..self.loop_frame_count)
             .map(|speed_frame| {
                 self.glide_speed
@@ -407,8 +447,10 @@ impl LapStyle {
             })
             .collect();
         let total_speed: f64 = lap_speeds.iter().sum();
+        // The speeds of the whole frames before this one; a freely swimming koi ignores
+        // the lap course, so a fractional frame counts from its whole frame.
         let covered_speed: f64 = lap_speeds[..loop_frame as usize].iter().sum();
-        let frame = f64::from(loop_frame);
+        let frame = loop_frame;
         let stroke = self.calculate_stroke(frame);
         let wave_phase_radians =
             STILL_POSE.wave_phase_radians + frame * TAU / self.wave_frame_count;

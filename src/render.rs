@@ -146,6 +146,13 @@ impl KoiRenderer {
         self.render_pose(&swim_pose, Framing::At(pose_center))
     }
 
+    /// The koi's body length from snout to tail stalk, in native pixels, without the
+    /// tail fin; [`crate::swim::SwimState::new`] takes it to size the pond's edges and
+    /// the trail it keeps.
+    pub fn body_length_pixels(&self) -> f64 {
+        self.koi_anatomy.body_length_pixels
+    }
+
     fn render_pose(&self, swim_pose: &SwimPose, framing: Framing) -> KoiFrame {
         render_pose(
             &self.koi_coat,
