@@ -70,6 +70,18 @@ impl KoiFrame {
 
     /// Build a frame from chosen pixels, for encoder tests that need colors no koi has.
     #[cfg(test)]
+    pub(crate) fn from_rgba_pixels_sized(
+        rgba_pixels: Vec<[u8; 4]>,
+        canvas_pixels: [u32; 2],
+    ) -> Self {
+        Self {
+            rgba_pixels,
+            canvas_pixels,
+        }
+    }
+
+    /// Build a still-sized frame from chosen pixels.
+    #[cfg(test)]
     pub(crate) fn from_rgba_pixels(rgba_pixels: Vec<[u8; 4]>) -> Self {
         Self {
             rgba_pixels,
@@ -213,8 +225,9 @@ impl KoiRenderer {
             }
         }
         // The frame's corner is the pond pixel that puts the koi's middle nearest the
-        // frame's middle, which leaves even the largest koi room for its outline. The dither pattern is then shifted by the corner, so it stays fixed to
-        // the pond as the koi swims through it, as it stays fixed to the frame on a lap.
+        // frame's middle, which leaves even the largest koi room for its outline. The
+        // dither pattern is then shifted by the corner, so it stays fixed to the pond as
+        // the koi swims through it, as it stays fixed to the frame on a lap.
         let frame_sizes = [f64::from(FREE_FRAME_PIXELS); 2];
         let top_left = [0, 1].map(|axis_index| {
             ((min_corner[axis_index] + max_corner[axis_index] - frame_sizes[axis_index]) / 2.0)

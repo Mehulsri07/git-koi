@@ -114,6 +114,9 @@ pub struct SwimState {
     waypoint_seconds: f64,
     /// Whether the koi is swimming straight past a goal inside its turning circle.
     is_passing_goal: bool,
+    /// The way the koi is turning the long way round to a goal behind it, away from an
+    /// edge: one or minus one, or zero when it is not.
+    long_turn_sign: f64,
     /// Whether the koi has arrived at its rest point and hovers there.
     is_hovering: bool,
     /// The food last eaten, ignored until the caller takes it away.
@@ -169,6 +172,7 @@ impl SwimState {
             waypoint: head,
             waypoint_seconds: 0.0,
             is_passing_goal: false,
+            long_turn_sign: 0.0,
             is_hovering: false,
             eaten_food: None,
             gulp_seconds: None,
@@ -235,9 +239,11 @@ impl SwimState {
             }
         };
         self.is_hovering = !is_steering;
+        let steering_goal = self.reach_past_edges(goal);
         let goal_turn_radians = if is_steering {
             wrap_angle(
-                (goal[1] - self.head[1]).atan2(goal[0] - self.head[0]) - self.heading_radians,
+                (steering_goal[1] - self.head[1]).atan2(steering_goal[0] - self.head[0])
+                    - self.heading_radians,
             )
         } else {
             0.0
@@ -249,7 +255,7 @@ impl SwimState {
         };
         self.speed_pixels_per_second += (target_speed - self.speed_pixels_per_second)
             * (1.0 - (-dt_seconds / SPEED_EASE_SECONDS).exp());
-        self.turn(goal, goal_turn_radians, dt_seconds);
+        self.turn(steering_goal, goal, goal_turn_radians, dt_seconds);
         let forward_direction = [self.heading_radians.cos(), self.heading_radians.sin()];
         let travel_pixels = self.speed_pixels_per_second * dt_seconds;
         self.head = self.clamp_to_area([
@@ -344,7 +350,13 @@ impl SwimState {
     /// Turn toward the goal, or away from an edge the koi is about to reach. A goal
     /// inside the circle the koi would turn on cannot be reached by turning, so the koi
     /// swims straight on until the goal is well clear of that circle.
-    fn turn(&mut self, goal: [f64; 2], goal_turn_radians: f64, dt_seconds: f64) {
+    fn turn(
+        &mut self,
+        goal: [f64; 2],
+        reached_goal: [f64; 2],
+        goal_turn_radians: f64,
+        dt_seconds: f64,
+    ) {
         let turn_radius_pixels = self.calculate_turn_radius();
         let turn_sign = if goal_turn_radians >= 0.0 { 1.0 } else { -1.0 };
         let turn_center = [
@@ -352,10 +364,17 @@ impl SwimState {
             self.head[1] + turn_sign * turn_radius_pixels * self.heading_radians.cos(),
         ];
         let center_to_goal_pixels = distance(turn_center, goal);
-        if center_to_goal_pixels < turn_radius_pixels {
+        if goal != reached_goal {
+            // A goal past an edge is reached by sliding along the edge, not by lining up
+            // with it, so the koi always turns for it; held at the edge, it can.
+            self.is_passing_goal = false;
+        } else if center_to_goal_pixels < turn_radius_pixels {
             self.is_passing_goal = true;
         } else if center_to_goal_pixels > GOAL_CLEARANCE_TURN_RADII * turn_radius_pixels {
             self.is_passing_goal = false;
+        }
+        if self.is_passing_goal || goal_turn_radians.abs() < PI / 2.0 {
+            self.long_turn_sign = 0.0;
         }
         let mut wanted_turn_radians = if self.is_passing_goal {
             0.0
@@ -369,15 +388,24 @@ impl SwimState {
             turn_radius_pixels + self.speed_pixels_per_second * WALL_LOOKAHEAD_SECONDS;
         // A goal ahead is inside the swimming area, so the edge beyond it does not
         // matter yet: the koi may swim up to a goal at the edge, held there by the clamp.
-        if !self.is_passing_goal && goal_turn_radians.cos() > 0.0 {
-            lookahead_pixels = lookahead_pixels.min(distance(self.head, goal));
+        // An edge the goal lies on is where the koi is headed, so it never turns away
+        // from that edge: held there, it slides along it while it turns for the goal.
+        let is_heading_for_goal = !self.is_passing_goal && goal_turn_radians.cos() > 0.0;
+        if is_heading_for_goal {
+            lookahead_pixels = lookahead_pixels.min(distance(self.head, reached_goal));
         }
         let mut mirrored_direction = forward_direction;
         let mut is_near_edge = false;
         for axis_index in 0..2 {
             let probe = self.head[axis_index] + forward_direction[axis_index] * lookahead_pixels;
-            if (probe < self.min_corner[axis_index] && forward_direction[axis_index] < 0.0)
-                || (probe > self.max_corner[axis_index] && forward_direction[axis_index] > 0.0)
+            let is_goal_on_min_edge = reached_goal[axis_index] <= self.min_corner[axis_index];
+            let is_goal_on_max_edge = reached_goal[axis_index] >= self.max_corner[axis_index];
+            if (probe < self.min_corner[axis_index]
+                && forward_direction[axis_index] < 0.0
+                && !is_goal_on_min_edge)
+                || (probe > self.max_corner[axis_index]
+                    && forward_direction[axis_index] > 0.0
+                    && !is_goal_on_max_edge)
             {
                 mirrored_direction[axis_index] = -forward_direction[axis_index];
                 is_near_edge = true;
@@ -396,8 +424,30 @@ impl SwimState {
             } else {
                 mirrored_direction
             };
-            wanted_turn_radians =
+            let escape_turn_radians =
                 wrap_angle(escape_direction[1].atan2(escape_direction[0]) - self.heading_radians);
+            // A goal behind that the short way round would turn the koi into the edge is
+            // turned for the long way round instead, away from the edge, rather than
+            // held off by the edge while the koi swims along it, away from the goal.
+            if self.long_turn_sign == 0.0
+                && !self.is_passing_goal
+                && goal_turn_radians.abs() > PI / 2.0
+                && goal_turn_radians.signum() != escape_turn_radians.signum()
+            {
+                self.long_turn_sign = escape_turn_radians.signum();
+            }
+            if self.long_turn_sign == 0.0 {
+                wanted_turn_radians = escape_turn_radians;
+            }
+        }
+        // Once begun, the long way round goes on until the goal is ahead, even after
+        // the edge falls out of sight, so the koi does not swing back toward the edge.
+        if self.long_turn_sign != 0.0 {
+            wanted_turn_radians = if goal_turn_radians.signum() == self.long_turn_sign {
+                goal_turn_radians
+            } else {
+                goal_turn_radians + self.long_turn_sign * TAU
+            };
         }
         // Turning rate is bounded both by the limit and by the tightest circle.
         let max_turn_radians = MAX_TURN_RADIANS_PER_SECOND
@@ -406,6 +456,31 @@ impl SwimState {
         self.heading_radians = wrap_angle(
             self.heading_radians + wanted_turn_radians.clamp(-max_turn_radians, max_turn_radians),
         );
+    }
+
+    /// Where to steer for a goal: the goal itself, or, for a goal on the edge of the
+    /// swimming area, a point beyond that edge by a turning radius, or by the distance
+    /// to the goal once that is shorter.
+    ///
+    /// A goal on an edge, and most of all in a corner, can lie inside the koi's turning
+    /// circle with no room to swing out and come back, so steering at it can circle it
+    /// for minutes. Aiming past the edge instead heads the koi into the edge near the
+    /// goal; the edge holds the head, which slides along it, and the aim pulls it along
+    /// the edge toward the goal, ever more gently as it nears. Goals inside the area are
+    /// steered at directly.
+    fn reach_past_edges(&self, goal: [f64; 2]) -> [f64; 2] {
+        // Near the goal the aim comes in closer, so the slide along the edge stays brisk
+        // to the end instead of fading with the shrinking angle.
+        let reach_pixels = self.calculate_turn_radius().min(distance(self.head, goal));
+        [0, 1].map(|axis_index| {
+            if goal[axis_index] <= self.min_corner[axis_index] {
+                goal[axis_index] - reach_pixels
+            } else if goal[axis_index] >= self.max_corner[axis_index] {
+                goal[axis_index] + reach_pixels
+            } else {
+                goal[axis_index]
+            }
+        })
     }
 
     /// The tightest circle the body can follow without wrapping around itself.
@@ -536,5 +611,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    const STEP_SECONDS: f64 = 1.0 / 60.0;
+    const PONDS: [[f64; 2]; 2] = [[480.0, 270.0], [960.0, 540.0]];
+    /// A young koi, a grown one, the adult length, and the largest koi.
+    const BODY_LENGTHS: [f64; 4] = [42.0, 99.4, 137.5, 167.5];
+    const BEHAVIORS: [Behavior; 5] = [
+        Behavior::Cruise,
+        Behavior::Dart,
+        Behavior::Rest,
+        Behavior::DeepRest,
+        Behavior::SurfaceFeeding,
+    ];
+    /// Wandered start states per pond and size. The sweeps are heavy for unoptimized
+    /// builds, so debug test runs take every eighth state; `cargo test --release` runs
+    /// them all.
+    const WANDERED_STATES: u64 = if cfg!(debug_assertions) { 25 } else { 200 };
+    const WANDERED_STRIDE: u64 = 200 / WANDERED_STATES;
+
+    /// A koi that has swum freely for up to two minutes, from varied seeds, behaviors,
+    /// and rest points, so tests start from wherever wandering leaves it.
+    fn wander(state_index: u64, pond_size: [f64; 2], body_length_pixels: f64) -> SwimState {
+        let mut random_state = state_index.wrapping_mul(0x5851_f42d_4c95_7f2d);
+        let pond = Pond {
+            width_pixels: pond_size[0],
+            height_pixels: pond_size[1],
+            rest_point: pond_size.map(|size| draw_fraction(&mut random_state) * size),
+        };
+        let mut swim_state = SwimState::new(state_index, pond, body_length_pixels);
+        let behavior = BEHAVIORS[state_index as usize % BEHAVIORS.len()];
+        let wander_steps = (draw_fraction(&mut random_state) * 120.0 * 60.0) as usize;
+        for _ in 0..wander_steps {
+            swim_state.step(STEP_SECONDS, behavior, None);
+        }
+        swim_state
+    }
+
+    /// Corners, edge midpoints, and points anywhere in the pond, in turn.
+    fn choose_point(state_index: u64, pond_size: [f64; 2], random_state: &mut u64) -> [f64; 2] {
+        let [width, height] = pond_size;
+        let turn = (state_index / 3 % 4) as usize;
+        match state_index % 3 {
+            0 => [[0.0, 0.0], [width, 0.0], [0.0, height], [width, height]][turn],
+            1 => [
+                [width / 2.0, 0.0],
+                [width / 2.0, height],
+                [0.0, height / 2.0],
+                [width, height / 2.0],
+            ][turn],
+            _ => pond_size.map(|size| draw_fraction(random_state) * size),
+        }
+    }
+
+    #[test]
+    fn food_anywhere_is_eaten_from_wandered_states() {
+        // Even a pond diagonal, about 1,100 px, takes under 30 s at food speed.
+        const GULP_SECONDS_LIMIT: f64 = 30.0;
+        for pond_size in PONDS {
+            for body_length_pixels in BODY_LENGTHS {
+                let mut random_state = 5;
+                for state_index in (0..200).step_by(WANDERED_STRIDE as usize) {
+                    let food = choose_point(state_index, pond_size, &mut random_state);
+                    let behavior = BEHAVIORS[(state_index / 2) as usize % BEHAVIORS.len()];
+                    let mut swim_state = wander(state_index, pond_size, body_length_pixels);
+                    let gulped = (0..(GULP_SECONDS_LIMIT * 60.0) as usize).any(|_| {
+                        swim_state.step(STEP_SECONDS, behavior, Some(food)) == SwimEvent::Gulped
+                    });
+                    assert!(
+                        gulped,
+                        "{pond_size:?} L={body_length_pixels} state {state_index} {behavior:?}: \
+                         food {food:?} not eaten, head at {:?}",
+                        swim_state.head
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rest_points_at_edges_settle_from_wandered_states() {
+        for pond_size in PONDS {
+            for body_length_pixels in BODY_LENGTHS {
+                for state_index in (0..120).step_by(WANDERED_STRIDE as usize) {
+                    let [width, height] = pond_size;
+                    let rest_point = [
+                        [0.0, 0.0],
+                        [width, 0.0],
+                        [0.0, height],
+                        [width, height],
+                        [width / 2.0, 0.0],
+                        [width / 2.0, height],
+                        [0.0, height / 2.0],
+                        [width, height / 2.0],
+                    ][state_index as usize / WANDERED_STRIDE as usize % 8];
+                    let behavior = BEHAVIORS[2 + state_index as usize % 3];
+                    let mut swim_state = wander(state_index, pond_size, body_length_pixels);
+                    swim_state.pond.rest_point = rest_point;
+                    let settled_point = swim_state.clamp_to_area(rest_point);
+                    // Time to swim there at cruising speed, plus time to slow and line up.
+                    let limit_seconds = (distance(swim_state.head, settled_point)
+                        / CRUISE_SPEED_PIXELS_PER_SECOND
+                        + 20.0)
+                        .max(60.0);
+                    for _ in 0..(limit_seconds * 60.0) as usize {
+                        swim_state.step(STEP_SECONDS, behavior, None);
+                    }
+                    let head_before = swim_state.head;
+                    swim_state.step(STEP_SECONDS, behavior, None);
+                    let speed = distance(head_before, swim_state.head) / STEP_SECONDS;
+                    assert!(
+                        distance(swim_state.head, settled_point) < 6.0 && speed < 1.0,
+                        "{pond_size:?} L={body_length_pixels} state {state_index} {behavior:?}: \
+                         rest {rest_point:?} -> {settled_point:?}, at {:?} moving {speed} px/s \
+                         after {limit_seconds:.0} s",
+                        swim_state.head
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn food_behind_beyond_an_edge_is_turned_for_the_long_way_round() {
+        // Heading down and right toward the bottom edge, with food far behind on the left
+        // edge near the bottom corner: the short way round turns into the bottom edge,
+        // which used to hold the koi swimming along it, away from the food, for 10 s.
+        let pond = Pond {
+            width_pixels: 960.0,
+            height_pixels: 540.0,
+            rest_point: [480.0, 270.0],
+        };
+        let mut swim_state = SwimState::new(110, pond, 137.5);
+        swim_state.head = [565.0, 391.1];
+        swim_state.heading_radians = 0.8;
+        swim_state.speed_pixels_per_second = 22.3;
+        let food = [44.8, 454.9];
+        // About 480 px at food speed is 12 s; turning around adds a few more.
+        let gulp_step = (0..25 * 60).find(|_| {
+            swim_state.step(STEP_SECONDS, Behavior::Cruise, Some(food)) == SwimEvent::Gulped
+        });
+        assert!(
+            gulp_step.is_some_and(|step_index| step_index < 20 * 60),
+            "gulped after {gulp_step:?} steps, head at {:?}",
+            swim_state.head
+        );
     }
 }

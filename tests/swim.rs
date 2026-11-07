@@ -546,6 +546,9 @@ fn a_pond_that_is_not_a_number_does_not_panic() {
     }
 }
 
+/// Steps between sampled frames in `free_frames_never_touch_the_frame_edge`.
+const FRAME_SAMPLE_STEPS: usize = if cfg!(debug_assertions) { 120 } else { 15 };
+
 #[test]
 fn free_frames_never_touch_the_frame_edge() {
     for total_contributions in [14, 12_750, 100_000] {
@@ -555,8 +558,10 @@ fn free_frames_never_touch_the_frame_edge() {
             let mut swim_state = SwimState::new(17, BIG_POND, koi_renderer.body_length_pixels());
             // A fresh, straight trail first, then poses through a minute of swimming,
             // sampled every 0.25 s off the 1/15 s frame grid as the website steps.
+            // Unoptimized builds sample every 2 s, which keeps the straight start and the
+            // tightest Dart turns this test first caught, at an eighth of the time.
             for step_index in 0..3600 {
-                if step_index % 15 == 0 {
+                if step_index % FRAME_SAMPLE_STEPS == 0 {
                     let free_frame = koi_renderer.render_free_frame(&swim_state, behavior);
                     let rgba_bytes = free_frame.frame.as_rgba_bytes();
                     let last = FREE_FRAME_PIXELS - 1;

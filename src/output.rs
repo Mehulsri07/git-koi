@@ -141,13 +141,14 @@ const GIF_TRANSPARENT_INDEX: u8 = 0;
 /// lasts exactly its frame count divided by the frame rate. Each frame stores only the
 /// box around its drawn pixels, with an exact palette of its colors, and that box clears
 /// before the next frame. Colors are never approximated: a frame with more than 255
-/// colors or a partly transparent pixel fails instead. Identical frames produce
+/// colors or a partly transparent pixel fails instead, as do frames whose canvases
+/// differ in size from the first. Identical frames produce
 /// identical bytes without I/O, timestamps, or input mutation.
 pub fn encode_gif(koi_frames: &[KoiFrame]) -> Result<Vec<u8>, GifEncodingError> {
     if koi_frames.is_empty() {
         return Err(GifEncodingError::NoFrames);
     }
-    // The screen takes the first frame's size; frames of a loop share one size.
+    // The screen takes the first frame's size, which every frame must share.
     let mut gif_encoder = gif::Encoder::new(
         Vec::new(),
         (koi_frames[0].width_pixels() * STATIC_EXPORT_SCALE) as u16,
@@ -156,6 +157,11 @@ pub fn encode_gif(koi_frames: &[KoiFrame]) -> Result<Vec<u8>, GifEncodingError> 
     )?;
     gif_encoder.set_repeat(gif::Repeat::Infinite)?;
     for (frame_index, koi_frame) in koi_frames.iter().enumerate() {
+        if [koi_frame.width_pixels(), koi_frame.height_pixels()]
+            != [koi_frames[0].width_pixels(), koi_frames[0].height_pixels()]
+        {
+            return Err(GifEncodingError::MismatchedFrameSizes { frame_index });
+        }
         let native_pixels = koi_frame.as_rgba_bytes().as_chunks::<4>().0;
         let native_width = koi_frame.width_pixels();
         let [box_left, box_top, box_width, box_height] =
@@ -259,6 +265,11 @@ pub enum GifEncodingError {
         /// The frame, counted from zero.
         frame_index: usize,
     },
+    /// A frame's canvas differs in size from the first frame's.
+    MismatchedFrameSizes {
+        /// The frame, counted from zero.
+        frame_index: usize,
+    },
     /// The GIF encoder failed; carries its own error.
     Encoder(gif::EncodingError),
 }
@@ -274,6 +285,10 @@ impl fmt::Display for GifEncodingError {
             Self::PartialTransparency { frame_index } => write!(
                 output_formatter,
                 "frame {frame_index} has partly transparent pixels, which a GIF cannot show"
+            ),
+            Self::MismatchedFrameSizes { frame_index } => write!(
+                output_formatter,
+                "frame {frame_index} is a different size from the first frame"
             ),
             Self::Encoder(encoding_error) => {
                 write!(output_formatter, "GIF encoding failed: {encoding_error}")
@@ -300,6 +315,7 @@ impl From<gif::EncodingError> for GifEncodingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::FREE_FRAME_PIXELS;
 
     const FRAME_PIXEL_COUNT: usize = (FRAME_WIDTH_PIXELS * FRAME_HEIGHT_PIXELS) as usize;
 
@@ -356,6 +372,19 @@ mod tests {
         assert!(matches!(
             encode_gif(&[frame_with_colors([[200, 100, 50, 128]])]),
             Err(GifEncodingError::PartialTransparency { frame_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn frames_of_different_sizes_fail() {
+        let small_frame = frame_with_colors([[1, 2, 3, 255]]);
+        let free_frame = KoiFrame::from_rgba_pixels_sized(
+            vec![[0; 4]; (FREE_FRAME_PIXELS * FREE_FRAME_PIXELS) as usize],
+            [FREE_FRAME_PIXELS; 2],
+        );
+        assert!(matches!(
+            encode_gif(&[frame_with_colors([[1, 2, 3, 255]]), small_frame, free_frame]),
+            Err(GifEncodingError::MismatchedFrameSizes { frame_index: 2 })
         ));
     }
 
