@@ -25,7 +25,10 @@ use crate::coat::{KoiBody, KoiCoat, WHITE_RAMP};
 use crate::koi::{
     ADULT_CONTRIBUTIONS, KoiDevelopment, YOUNG_SHAPE_CONTRIBUTIONS, calculate_growth_fraction,
 };
-use crate::motion::{Course, STILL_POSE, SwimPose, calculate_swim_pose, frame_count};
+use crate::motion::{
+    Course, STILL_POSE, SwimPose, calculate_free_pose, calculate_swim_pose, frame_count,
+};
+use crate::swim::SwimState;
 
 /// Width of the native canvas every koi is drawn on, at every growth level.
 pub const FRAME_WIDTH_PIXELS: u32 = 256;
@@ -153,6 +156,50 @@ impl KoiRenderer {
         self.koi_anatomy.body_length_pixels
     }
 
+    /// The koi as it swims freely in a pond, in `behavior`'s fin, wave, whisker, and
+    /// mouth movements at the swim state's own clock, with its body laid back along the
+    /// path its head swam. Resting and deep rest show at their hover depths; a fresh
+    /// gulp opens the mouth. The frame is the usual square canvas, placed in the pond with
+    /// the koi near its middle; see [`FreeFrame`].
+    ///
+    /// Pass the state of a [`SwimState`] built with this renderer's
+    /// [`Self::body_length_pixels`]; a shorter trail is continued straight back.
+    pub fn render_free_frame(&self, swim_state: &SwimState, behavior: Behavior) -> FreeFrame {
+        let mut swim_pose = calculate_free_pose(behavior, swim_state.calculate_frame());
+        swim_pose.mouth_opening = swim_pose
+            .mouth_opening
+            .max(swim_state.calculate_gulp_opening());
+        let body_spine = build_free_spine(&self.koi_anatomy, swim_state, &swim_pose);
+        let fin_curves = build_fins(&body_spine, &self.koi_anatomy, &swim_pose);
+        let curve_bounds = measure_curve_bounds(&body_spine, &fin_curves);
+        // The frame's corner snaps to whole multiples of the dither pattern, so the
+        // pattern stays fixed to the pond as the koi swims through it, as it stays fixed
+        // to the frame on a lap; the koi is within two pixels of the middle.
+        let dither_size = DITHER_RANKS.len() as f64;
+        let frame_sizes = [
+            f64::from(FRAME_WIDTH_PIXELS),
+            f64::from(FRAME_HEIGHT_PIXELS),
+        ];
+        let top_left = [0, 1].map(|axis_index| {
+            let koi_middle = (curve_bounds[0][axis_index] + curve_bounds[1][axis_index]) / 2.0;
+            ((koi_middle - frame_sizes[axis_index] / 2.0) / dither_size).round() * dither_size
+        });
+        let pose_center =
+            [0, 1].map(|axis_index| top_left[axis_index] + frame_sizes[axis_index] / 2.0);
+        FreeFrame {
+            frame: draw_curves(
+                &self.koi_coat,
+                self.koi_body,
+                &self.koi_anatomy,
+                &swim_pose,
+                &body_spine,
+                &fin_curves,
+                pose_center,
+            ),
+            top_left: top_left.map(|corner| corner as i32),
+        }
+    }
+
     fn render_pose(&self, swim_pose: &SwimPose, framing: Framing) -> KoiFrame {
         render_pose(
             &self.koi_coat,
@@ -162,6 +209,17 @@ impl KoiRenderer {
             framing,
         )
     }
+}
+
+/// A freely swimming koi's frame and where it goes in the pond.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FreeFrame {
+    /// The koi on the usual square canvas, transparent around it.
+    pub frame: KoiFrame,
+    /// The pond pixel under the frame's top left pixel: frame pixel `[x, y]` covers pond
+    /// pixel `[top_left[0] + x, top_left[1] + y]`, whose area runs from that corner one
+    /// pixel right and down. Each coordinate is a multiple of four.
+    pub top_left: [i32; 2],
 }
 
 const BEHAVIOR_COUNT: usize = 5;
@@ -273,11 +331,34 @@ fn render_pose(
         ],
         Framing::At(pose_center) => pose_center,
     };
+    draw_curves(
+        koi_coat,
+        koi_body,
+        koi_anatomy,
+        swim_pose,
+        &body_spine,
+        &fin_curves,
+        pose_center,
+    )
+}
+
+/// Draw the koi's curves on the canvas centered on `pose_center`, with its mouth,
+/// whiskers, outline, any feeding, and its depth.
+fn draw_curves(
+    koi_coat: &KoiCoat,
+    koi_body: KoiBody,
+    koi_anatomy: &KoiAnatomy,
+    swim_pose: &SwimPose,
+    body_spine: &[CurvePoint],
+    fin_curves: &[Vec<CurvePoint>],
+    pose_center: [f64; 2],
+) -> KoiFrame {
+    let [min_corner, max_corner] = measure_curve_bounds(body_spine, fin_curves);
     let koi_appearance = KoiAppearance {
         koi_anatomy,
         koi_coat,
     };
-    let body_grid = SegmentGrid::new(&body_spine);
+    let body_grid = SegmentGrid::new(body_spine);
     let fin_grids: Vec<SegmentGrid> = fin_curves
         .iter()
         .map(|fin_curve| SegmentGrid::new(fin_curve))
@@ -309,7 +390,7 @@ fn render_pose(
     }
     paint_mouth(
         &mut rgba_pixels,
-        &body_spine,
+        body_spine,
         koi_body,
         pose_center,
         swim_pose.mouth_opening,
@@ -319,13 +400,13 @@ fn render_pose(
         .map(|pixel_channels| pixel_channels[3] != 0)
         .collect();
     let whisker_points =
-        calculate_whisker_points(&body_spine, koi_anatomy, swim_pose.whisker_sway_radians);
+        calculate_whisker_points(body_spine, koi_anatomy, swim_pose.whisker_sway_radians);
     paint_whiskers(&mut rgba_pixels, &whisker_points, pose_center);
     paint_outline(&mut rgba_pixels);
     if let Some(feeding_phase) = swim_pose.feeding_phase {
         paint_feeding(
             &mut rgba_pixels,
-            &body_spine,
+            body_spine,
             koi_anatomy,
             pose_center,
             feeding_phase,
@@ -806,15 +887,10 @@ fn smooth_step(fraction: f64) -> f64 {
 fn build_spine(koi_anatomy: &KoiAnatomy, swim_pose: &SwimPose) -> Vec<CurvePoint> {
     const HEADING_RADIANS: f64 = -0.08;
     const BEND_RADIANS: f64 = 0.35;
-    const WAVE_AMPLITUDE_FRACTION: f64 = 0.06;
-    const WAVE_CYCLES: f64 = 0.9;
     let body_length_pixels = koi_anatomy.body_length_pixels;
-    let point_count = body_length_pixels.round() as usize;
-    const MIN_HALF_WIDTH_PIXELS: f64 = 1.3;
-    let calculate_point_half_width = |point_index: usize| {
-        calculate_body_half_width(point_index as f64 / point_count as f64, koi_anatomy)
-            .max(MIN_HALF_WIDTH_PIXELS)
-    };
+    let point_count = calculate_spine_point_count(koi_anatomy);
+    let calculate_point_half_width =
+        |point_index: usize| calculate_spine_half_width(point_index, point_count, koi_anatomy);
     let center_points = match swim_pose.course {
         Course::Hover {
             heading_offset_radians,
@@ -857,10 +933,58 @@ fn build_spine(koi_anatomy: &KoiAnatomy, swim_pose: &SwimPose) -> Vec<CurvePoint
                 .collect()
         }
     };
+    apply_body_wave(&center_points, body_length_pixels, swim_pose)
+}
+
+/// The spine of a freely swimming koi: each body point one pixel of arc behind the one
+/// in front along the path the head swam, as on the lap circle, with the same wave.
+fn build_free_spine(
+    koi_anatomy: &KoiAnatomy,
+    swim_state: &SwimState,
+    swim_pose: &SwimPose,
+) -> Vec<CurvePoint> {
+    let point_count = calculate_spine_point_count(koi_anatomy);
+    let center_points: Vec<CurvePoint> = swim_state
+        .trace_back(point_count)
+        .into_iter()
+        .enumerate()
+        .map(|(point_index, position)| CurvePoint {
+            position,
+            half_width_pixels: calculate_spine_half_width(point_index, point_count, koi_anatomy),
+        })
+        .collect();
+    apply_body_wave(&center_points, koi_anatomy.body_length_pixels, swim_pose)
+}
+
+/// One spine point per pixel of body length.
+fn calculate_spine_point_count(koi_anatomy: &KoiAnatomy) -> usize {
+    koi_anatomy.body_length_pixels.round() as usize
+}
+
+fn calculate_spine_half_width(
+    point_index: usize,
+    point_count: usize,
+    koi_anatomy: &KoiAnatomy,
+) -> f64 {
+    const MIN_HALF_WIDTH_PIXELS: f64 = 1.3;
+    calculate_body_half_width(point_index as f64 / point_count as f64, koi_anatomy)
+        .max(MIN_HALF_WIDTH_PIXELS)
+}
+
+/// Swing the spine's center line side to side in the pose's body wave, more toward the
+/// tail.
+fn apply_body_wave(
+    center_points: &[CurvePoint],
+    body_length_pixels: f64,
+    swim_pose: &SwimPose,
+) -> Vec<CurvePoint> {
+    const WAVE_AMPLITUDE_FRACTION: f64 = 0.06;
+    const WAVE_CYCLES: f64 = 0.9;
+    let point_count = center_points.len();
     let mut body_spine = Vec::with_capacity(point_count);
     for (point_index, center_point) in center_points.iter().enumerate() {
         let along_fraction = point_index as f64 / point_count as f64;
-        let forward_direction = calculate_forward_direction(&center_points, point_index);
+        let forward_direction = calculate_forward_direction(center_points, point_index);
         let head_wave_fraction = 0.1;
         let wave_envelope =
             head_wave_fraction + (1.0 - head_wave_fraction) * along_fraction.powi(2);

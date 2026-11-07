@@ -224,6 +224,23 @@ pub fn calculate_swim_pose(behavior: Behavior, frame_index: u32) -> SwimPose {
     compose_pose(&drive, &trailing_drive)
 }
 
+/// The pose at any moment of a behavior's loop, for a koi swimming freely: `frame` counts
+/// frames at FRAMES_PER_SECOND and may be fractional or past the loop, which it wraps
+/// around. At a whole frame number it is [`calculate_swim_pose`]'s pose for that frame.
+/// The course is the loop's own; a freely swimming koi follows its own path instead.
+pub(crate) fn calculate_free_pose(behavior: Behavior, frame: f64) -> SwimPose {
+    let loop_frame_count = f64::from(frame_count(behavior));
+    let loop_frame = wrap_frame(frame, loop_frame_count);
+    let trailing_frame = wrap_frame(
+        loop_frame - f64::from(SIDE_FIN_TRAIL_FRAMES),
+        loop_frame_count,
+    );
+    compose_pose(
+        &calculate_drive(behavior, loop_frame),
+        &calculate_drive(behavior, trailing_frame),
+    )
+}
+
 /// A frame number wrapped into the loop, from zero up to its frame count.
 fn wrap_frame(frame: f64, loop_frame_count: f64) -> f64 {
     let loop_frame = frame.rem_euclid(loop_frame_count);

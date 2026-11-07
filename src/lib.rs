@@ -15,7 +15,7 @@
 //!    it as PNG, SVG, or a looping GIF, with a preview page.
 //! 7. [`pond`] lays out one lilypad per owned public repository for the pond banner.
 //! 8. [`swim`] steps a koi swimming freely through a pond toward food, waypoints, or
-//!    its rest point.
+//!    its rest point, and [`render::KoiRenderer::render_free_frame`] draws it there.
 //!
 //! Everything after collection is deterministic: it reads no clock, performs no I/O, and
 //! mutates no input. Callers own files and publication. The `git-koi` command composes

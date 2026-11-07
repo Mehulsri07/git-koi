@@ -1,6 +1,7 @@
 //! Time `render_swim_frame` per frame across growth, for the koi pond that renders every
 //! animation frame, both as one call per frame and through a `KoiRenderer` built once
-//! and kept across frames. Run with `cargo run --release --locked --example render-speed`.
+//! and kept across frames, and a freely swimming koi's step and frame together for the
+//! largest koi. Run with `cargo run --release --locked --example render-speed`.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -10,10 +11,19 @@ use git_koi::coat::KoiBody;
 use git_koi::history::AccountSnapshot;
 use git_koi::koi::derive_koi_development;
 use git_koi::render::{KoiRenderer, render_swim_frame};
+use git_koi::swim::{Pond, SwimState};
 
 const GROWTH_TOTALS: [u64; 4] = [14, 1_500, 12_750, 100_000];
 const BEHAVIORS: [(Behavior, &str); 2] = [(Behavior::Cruise, "Cruise"), (Behavior::Rest, "Rest")];
 const TIMED_FRAME_COUNT: u32 = 200;
+/// Free swimming is timed for the largest koi, one step of a sixtieth of a second per frame.
+const FREE_TOTAL: u64 = 100_000;
+const FREE_STEP_SECONDS: f64 = 1.0 / 60.0;
+const FREE_POND: Pond = Pond {
+    width_pixels: 960.0,
+    height_pixels: 540.0,
+    rest_point: [480.0, 270.0],
+};
 
 fn main() {
     let account_snapshot: AccountSnapshot =
@@ -56,5 +66,19 @@ fn main() {
                 "cached total={total_contributions} {behavior_name}: {frame_milliseconds:.2} ms/frame"
             );
         }
+    }
+    koi_development.total_contributions = FREE_TOTAL;
+    let koi_renderer = KoiRenderer::new(&koi_development, KoiBody::default());
+    for (behavior, behavior_name) in BEHAVIORS {
+        let mut swim_state = SwimState::new(1, FREE_POND, koi_renderer.body_length_pixels());
+        black_box(koi_renderer.render_free_frame(&swim_state, behavior));
+        let started_at = Instant::now();
+        for _ in 0..TIMED_FRAME_COUNT {
+            black_box(swim_state.step(FREE_STEP_SECONDS, behavior, None));
+            black_box(black_box(&koi_renderer).render_free_frame(&swim_state, behavior));
+        }
+        let frame_milliseconds =
+            started_at.elapsed().as_secs_f64() * 1_000.0 / f64::from(TIMED_FRAME_COUNT);
+        println!("free total={FREE_TOTAL} {behavior_name}: {frame_milliseconds:.2} ms/frame");
     }
 }

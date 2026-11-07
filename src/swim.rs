@@ -17,8 +17,8 @@
 //! turns away from an edge it is about to reach, and is held at the edge if it still
 //! reaches it.
 //!
-//! The state keeps the head's recent path, as long as the body needs, so the body can
-//! be laid back along it.
+//! The state keeps the head's recent path, as long as the body needs, so
+//! [`crate::render::KoiRenderer::render_free_frame`] can lay the body back along it.
 //! Like the rest of the crate, swimming is deterministic and reads no clock: the caller
 //! passes each step's duration.
 
@@ -243,6 +243,56 @@ impl SwimState {
     /// [`crate::motion::FRAMES_PER_SECOND`].
     pub(crate) fn calculate_frame(&self) -> f64 {
         self.clock_seconds * f64::from(crate::motion::FRAMES_PER_SECOND)
+    }
+
+    /// How far the gulp opens the mouth now, from zero closed to one wide open.
+    pub(crate) fn calculate_gulp_opening(&self) -> f64 {
+        self.gulp_seconds.map_or(0.0, |gulp_seconds| {
+            (PI * gulp_seconds / GULP_SECONDS).sin().max(0.0)
+        })
+    }
+
+    /// Points along the swum path, one pixel of arc apart, from the head back: the first
+    /// is the head itself. A path shorter than asked for continues straight back.
+    pub(crate) fn trace_back(&self, point_count: usize) -> Vec<[f64; 2]> {
+        let mut traced_points = Vec::with_capacity(point_count);
+        if point_count == 0 {
+            return traced_points;
+        }
+        traced_points.push(self.head);
+        let mut segment_start = self.head;
+        // Arc length from the head to the start of the current segment.
+        let mut segment_start_arc = 0.0;
+        let mut last_direction = [-self.heading_radians.cos(), -self.heading_radians.sin()];
+        for &segment_end in &self.trail {
+            let segment_pixels = distance(segment_start, segment_end);
+            if segment_pixels == 0.0 {
+                continue;
+            }
+            last_direction = [0, 1].map(|axis_index| {
+                (segment_end[axis_index] - segment_start[axis_index]) / segment_pixels
+            });
+            let segment_end_arc = segment_start_arc + segment_pixels;
+            while traced_points.len() < point_count && traced_points.len() as f64 <= segment_end_arc
+            {
+                let arc_into_segment = traced_points.len() as f64 - segment_start_arc;
+                traced_points.push([0, 1].map(|axis_index| {
+                    segment_start[axis_index] + last_direction[axis_index] * arc_into_segment
+                }));
+            }
+            if traced_points.len() == point_count {
+                return traced_points;
+            }
+            segment_start = segment_end;
+            segment_start_arc = segment_end_arc;
+        }
+        while traced_points.len() < point_count {
+            let arc_beyond = traced_points.len() as f64 - segment_start_arc;
+            traced_points.push([0, 1].map(|axis_index| {
+                segment_start[axis_index] + last_direction[axis_index] * arc_beyond
+            }));
+        }
+        traced_points
     }
 
     /// Turn toward the goal, or away from an edge the koi is about to reach. A goal
