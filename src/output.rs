@@ -16,9 +16,10 @@ use crate::render::{FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, KoiFrame};
 
 /// Each native pixel becomes this many export pixels on each side.
 pub const STATIC_EXPORT_SCALE: u32 = 2;
-/// Width of every exported image.
+/// Width of every exported still or loop; a freely swimming koi's larger canvas exports
+/// at the same scale.
 pub const STATIC_WIDTH_PIXELS: u32 = FRAME_WIDTH_PIXELS * STATIC_EXPORT_SCALE;
-/// Height of every exported image.
+/// Height of every exported still or loop.
 pub const STATIC_HEIGHT_PIXELS: u32 = FRAME_HEIGHT_PIXELS * STATIC_EXPORT_SCALE;
 
 /// Encode a static PNG by repeating each native pixel in both dimensions.
@@ -26,15 +27,17 @@ pub const STATIC_HEIGHT_PIXELS: u32 = FRAME_HEIGHT_PIXELS * STATIC_EXPORT_SCALE;
 /// Encoding errors propagate before the caller publishes any resulting bytes.
 pub fn encode_png(koi_frame: &KoiFrame) -> Result<Vec<u8>, png::EncodingError> {
     let native_pixels = koi_frame.as_rgba_bytes().as_chunks::<4>().0;
-    let mut export_pixels = vec![[0; 4]; (STATIC_WIDTH_PIXELS * STATIC_HEIGHT_PIXELS) as usize];
+    let native_width = koi_frame.width_pixels();
+    let [export_width, export_height] = [native_width, koi_frame.height_pixels()]
+        .map(|native_size| native_size * STATIC_EXPORT_SCALE);
+    let mut export_pixels = vec![[0; 4]; (export_width * export_height) as usize];
     for (pixel_index, pixel_channels) in export_pixels.iter_mut().enumerate() {
-        let native_x = pixel_index as u32 % STATIC_WIDTH_PIXELS / STATIC_EXPORT_SCALE;
-        let native_y = pixel_index as u32 / STATIC_WIDTH_PIXELS / STATIC_EXPORT_SCALE;
-        *pixel_channels = native_pixels[(native_y * FRAME_WIDTH_PIXELS + native_x) as usize];
+        let native_x = pixel_index as u32 % export_width / STATIC_EXPORT_SCALE;
+        let native_y = pixel_index as u32 / export_width / STATIC_EXPORT_SCALE;
+        *pixel_channels = native_pixels[(native_y * native_width + native_x) as usize];
     }
     let mut png_bytes = Vec::new();
-    let mut png_encoder =
-        png::Encoder::new(&mut png_bytes, STATIC_WIDTH_PIXELS, STATIC_HEIGHT_PIXELS);
+    let mut png_encoder = png::Encoder::new(&mut png_bytes, export_width, export_height);
     png_encoder.set_color(png::ColorType::Rgba);
     png_encoder.set_depth(png::BitDepth::Eight);
     let mut png_writer = png_encoder.write_header()?;
@@ -48,16 +51,19 @@ pub fn encode_png(koi_frame: &KoiFrame) -> Result<Vec<u8>, png::EncodingError> {
 /// are omitted; visible pixels retain their color and alpha. Identical frames produce
 /// identical documents without I/O, timestamps, external assets, or input mutation.
 pub fn encode_svg(koi_frame: &KoiFrame) -> String {
+    let [native_width, native_height] = [koi_frame.width_pixels(), koi_frame.height_pixels()];
+    let [export_width, export_height] =
+        [native_width, native_height].map(|native_size| native_size * STATIC_EXPORT_SCALE);
     let mut svg_document = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{STATIC_WIDTH_PIXELS}\" height=\"{STATIC_HEIGHT_PIXELS}\" viewBox=\"0 0 {FRAME_WIDTH_PIXELS} {FRAME_HEIGHT_PIXELS}\" shape-rendering=\"crispEdges\">\n"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{export_width}\" height=\"{export_height}\" viewBox=\"0 0 {native_width} {native_height}\" shape-rendering=\"crispEdges\">\n"
     );
     let native_pixels = koi_frame.as_rgba_bytes().as_chunks::<4>().0;
     let mut pixel_index = 0;
     while pixel_index < native_pixels.len() {
         let pixel_channels = native_pixels[pixel_index];
-        let pixel_x = pixel_index % FRAME_WIDTH_PIXELS as usize;
-        let pixel_y = pixel_index / FRAME_WIDTH_PIXELS as usize;
-        let row_end_index = (pixel_y + 1) * FRAME_WIDTH_PIXELS as usize;
+        let pixel_x = pixel_index % native_width as usize;
+        let pixel_y = pixel_index / native_width as usize;
+        let row_end_index = (pixel_y + 1) * native_width as usize;
         let run_length_pixels = native_pixels[pixel_index..row_end_index]
             .iter()
             .take_while(|next_pixel| **next_pixel == pixel_channels)
@@ -141,23 +147,26 @@ pub fn encode_gif(koi_frames: &[KoiFrame]) -> Result<Vec<u8>, GifEncodingError> 
     if koi_frames.is_empty() {
         return Err(GifEncodingError::NoFrames);
     }
+    // The screen takes the first frame's size; frames of a loop share one size.
     let mut gif_encoder = gif::Encoder::new(
         Vec::new(),
-        STATIC_WIDTH_PIXELS as u16,
-        STATIC_HEIGHT_PIXELS as u16,
+        (koi_frames[0].width_pixels() * STATIC_EXPORT_SCALE) as u16,
+        (koi_frames[0].height_pixels() * STATIC_EXPORT_SCALE) as u16,
         &[],
     )?;
     gif_encoder.set_repeat(gif::Repeat::Infinite)?;
     for (frame_index, koi_frame) in koi_frames.iter().enumerate() {
         let native_pixels = koi_frame.as_rgba_bytes().as_chunks::<4>().0;
-        let [box_left, box_top, box_width, box_height] = find_drawn_box(native_pixels);
+        let native_width = koi_frame.width_pixels();
+        let [box_left, box_top, box_width, box_height] =
+            find_drawn_box(native_pixels, native_width);
         let mut palette_indices: BTreeMap<[u8; 3], u8> = BTreeMap::new();
         let mut palette_channels = vec![0; 3];
         let mut native_indices = Vec::with_capacity((box_width * box_height) as usize);
         for native_y in box_top..box_top + box_height {
             for native_x in box_left..box_left + box_width {
                 let [red, green, blue, alpha] =
-                    native_pixels[(native_y * FRAME_WIDTH_PIXELS + native_x) as usize];
+                    native_pixels[(native_y * native_width + native_x) as usize];
                 let palette_index = match alpha {
                     0 => GIF_TRANSPARENT_INDEX,
                     255 => match palette_indices.get(&[red, green, blue]) {
@@ -208,14 +217,14 @@ pub fn encode_gif(koi_frames: &[KoiFrame]) -> Result<Vec<u8>, GifEncodingError> 
 
 /// The native box `[left, top, width, height]` around a frame's drawn pixels; a frame
 /// with none keeps one transparent pixel, since a GIF frame cannot be empty.
-fn find_drawn_box(native_pixels: &[[u8; 4]]) -> [u32; 4] {
+fn find_drawn_box(native_pixels: &[[u8; 4]], native_width: u32) -> [u32; 4] {
     let mut drawn_edges: Option<[u32; 4]> = None;
     for (pixel_index, pixel_channels) in native_pixels.iter().enumerate() {
         if pixel_channels[3] == 0 {
             continue;
         }
-        let pixel_x = pixel_index as u32 % FRAME_WIDTH_PIXELS;
-        let pixel_y = pixel_index as u32 / FRAME_WIDTH_PIXELS;
+        let pixel_x = pixel_index as u32 % native_width;
+        let pixel_y = pixel_index as u32 / native_width;
         let [left, top, right, bottom] =
             drawn_edges.get_or_insert([pixel_x, pixel_y, pixel_x, pixel_y]);
         *left = (*left).min(pixel_x);

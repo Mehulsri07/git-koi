@@ -63,6 +63,12 @@ const REST_SLOWING_PIXELS: f64 = 40.0;
 const REST_ARRIVED_PIXELS: f64 = 3.0;
 /// The koi looks this far ahead, beyond its turning radius, for the pond edge.
 const WALL_LOOKAHEAD_SECONDS: f64 = 0.5;
+/// A goal found inside the turning circle is passed straight by until it is at least this
+/// many turning radii from the circle's center, so that turning toward it afterwards
+/// lines the koi up with it instead of circling it.
+const GOAL_CLEARANCE_TURN_RADII: f64 = 1.5;
+/// A wandering koi that has not reached its waypoint in this long picks another.
+const WAYPOINT_PATIENCE_SECONDS: f64 = 60.0;
 /// The trail keeps a new head position once the head has moved this far from the last.
 const TRAIL_SPACING_PIXELS: f64 = 0.5;
 /// The trail runs this much past the body length, so rounding never runs it short.
@@ -104,6 +110,12 @@ pub struct SwimState {
     clock_seconds: f64,
     random_state: u64,
     waypoint: [f64; 2],
+    /// Seconds spent heading for the current waypoint.
+    waypoint_seconds: f64,
+    /// Whether the koi is swimming straight past a goal inside its turning circle.
+    is_passing_goal: bool,
+    /// Whether the koi has arrived at its rest point and hovers there.
+    is_hovering: bool,
     /// The food last eaten, ignored until the caller takes it away.
     eaten_food: Option<[f64; 2]>,
     /// Seconds since the last gulp, while the mouth is still in it.
@@ -116,7 +128,25 @@ impl SwimState {
     /// Koi at the pond center heading right; `seed` drives wandering; `body_length_pixels`
     /// is [`crate::render::KoiRenderer::body_length_pixels`] for the koi drawn. The trail
     /// starts straight behind the head, as if the koi had been swimming right.
+    ///
+    /// A pond size or body length that is negative or not a finite number counts as zero,
+    /// and a rest point that is not finite is the pond center, so the state always stays
+    /// finite.
     pub fn new(seed: u64, pond: Pond, body_length_pixels: f64) -> Self {
+        let keep_size = |size: f64| if size.is_finite() { size.max(0.0) } else { 0.0 };
+        let body_length_pixels = keep_size(body_length_pixels);
+        let mut pond = Pond {
+            width_pixels: keep_size(pond.width_pixels),
+            height_pixels: keep_size(pond.height_pixels),
+            ..pond
+        };
+        if !pond
+            .rest_point
+            .iter()
+            .all(|coordinate| coordinate.is_finite())
+        {
+            pond.rest_point = [pond.width_pixels / 2.0, pond.height_pixels / 2.0];
+        }
         let inset_pixels = WALL_INSET_BODY_LENGTHS * body_length_pixels;
         let pond_size = [pond.width_pixels, pond.height_pixels];
         let min_corner = [0, 1].map(|axis_index| inset_pixels.min(pond_size[axis_index] / 2.0));
@@ -137,6 +167,9 @@ impl SwimState {
             clock_seconds: 0.0,
             random_state: seed,
             waypoint: head,
+            waypoint_seconds: 0.0,
+            is_passing_goal: false,
+            is_hovering: false,
             eaten_food: None,
             gulp_seconds: None,
             trail,
@@ -150,6 +183,7 @@ impl SwimState {
     /// A step that is negative or not a number takes no time. Food beyond the swimming
     /// area is chased to the nearest point the head can reach and gulped there. Once the
     /// koi gulps a piece of food it ignores that same point until a step passes no food.
+    /// Food that is not a finite point counts as no food.
     pub fn step(
         &mut self,
         dt_seconds: f64,
@@ -166,14 +200,20 @@ impl SwimState {
             .gulp_seconds
             .map(|gulp_seconds| gulp_seconds + dt_seconds)
             .filter(|&gulp_seconds| gulp_seconds < GULP_SECONDS);
+        let food =
+            food.filter(|food_point| food_point.iter().all(|coordinate| coordinate.is_finite()));
         if food.is_none() {
             self.eaten_food = None;
         }
         let food = food.filter(|&food_point| self.eaten_food != Some(food_point));
         let reachable_food = food.map(|food_point| self.clamp_to_area(food_point));
-        if reachable_food.is_none() && distance(self.head, self.waypoint) < WAYPOINT_REACHED_PIXELS
+        self.waypoint_seconds += dt_seconds;
+        if reachable_food.is_none()
+            && (distance(self.head, self.waypoint) < WAYPOINT_REACHED_PIXELS
+                || self.waypoint_seconds >= WAYPOINT_PATIENCE_SECONDS)
         {
             self.waypoint = self.draw_waypoint();
+            self.waypoint_seconds = 0.0;
         }
         let (goal, target_speed, is_steering) = match (reachable_food, behavior) {
             (Some(food_point), _) => (food_point, FOOD_SPEED_PIXELS_PER_SECOND, true),
@@ -194,6 +234,7 @@ impl SwimState {
                 )
             }
         };
+        self.is_hovering = !is_steering;
         let goal_turn_radians = if is_steering {
             wrap_angle(
                 (goal[1] - self.head[1]).atan2(goal[0] - self.head[0]) - self.heading_radians,
@@ -243,6 +284,11 @@ impl SwimState {
     /// [`crate::motion::FRAMES_PER_SECOND`].
     pub(crate) fn calculate_frame(&self) -> f64 {
         self.clock_seconds * f64::from(crate::motion::FRAMES_PER_SECOND)
+    }
+
+    /// Whether the koi has arrived at its rest point and hovers there.
+    pub(crate) fn is_hovering(&self) -> bool {
+        self.is_hovering
     }
 
     /// How far the gulp opens the mouth now, from zero closed to one wide open.
@@ -297,7 +343,7 @@ impl SwimState {
 
     /// Turn toward the goal, or away from an edge the koi is about to reach. A goal
     /// inside the circle the koi would turn on cannot be reached by turning, so the koi
-    /// swims straight on until it can.
+    /// swims straight on until the goal is well clear of that circle.
     fn turn(&mut self, goal: [f64; 2], goal_turn_radians: f64, dt_seconds: f64) {
         let turn_radius_pixels = self.calculate_turn_radius();
         let turn_sign = if goal_turn_radians >= 0.0 { 1.0 } else { -1.0 };
@@ -305,7 +351,13 @@ impl SwimState {
             self.head[0] - turn_sign * turn_radius_pixels * self.heading_radians.sin(),
             self.head[1] + turn_sign * turn_radius_pixels * self.heading_radians.cos(),
         ];
-        let mut wanted_turn_radians = if distance(turn_center, goal) < turn_radius_pixels {
+        let center_to_goal_pixels = distance(turn_center, goal);
+        if center_to_goal_pixels < turn_radius_pixels {
+            self.is_passing_goal = true;
+        } else if center_to_goal_pixels > GOAL_CLEARANCE_TURN_RADII * turn_radius_pixels {
+            self.is_passing_goal = false;
+        }
+        let mut wanted_turn_radians = if self.is_passing_goal {
             0.0
         } else {
             goal_turn_radians
@@ -313,8 +365,13 @@ impl SwimState {
         // Look ahead for the edge, and turn between the heading mirrored off it and the
         // way to the middle of the swimming area, which also picks a side in a corner.
         let forward_direction = [self.heading_radians.cos(), self.heading_radians.sin()];
-        let lookahead_pixels =
+        let mut lookahead_pixels =
             turn_radius_pixels + self.speed_pixels_per_second * WALL_LOOKAHEAD_SECONDS;
+        // A goal ahead is inside the swimming area, so the edge beyond it does not
+        // matter yet: the koi may swim up to a goal at the edge, held there by the clamp.
+        if !self.is_passing_goal && goal_turn_radians.cos() > 0.0 {
+            lookahead_pixels = lookahead_pixels.min(distance(self.head, goal));
+        }
         let mut mirrored_direction = forward_direction;
         let mut is_near_edge = false;
         for axis_index in 0..2 {
@@ -419,4 +476,65 @@ fn draw_fraction(random_state: &mut u64) -> f64 {
     mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     mixed ^= mixed >> 31;
     (mixed >> 11) as f64 / (1_u64 << 53) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Waypoints a wandering koi reaches in each minute of ten.
+    fn count_waypoints_per_minute(
+        seed: u64,
+        pond: Pond,
+        body_length_pixels: f64,
+        behavior: Behavior,
+    ) -> Vec<usize> {
+        const STEP_SECONDS: f64 = 1.0 / 60.0;
+        let mut swim_state = SwimState::new(seed, pond, body_length_pixels);
+        (0..10)
+            .map(|_| {
+                let mut reached_count = 0;
+                for _ in 0..60 * 60 {
+                    // Count only waypoints reached, not ones given up on.
+                    if distance(swim_state.head, swim_state.waypoint) < WAYPOINT_REACHED_PIXELS {
+                        reached_count += 1;
+                    }
+                    swim_state.step(STEP_SECONDS, behavior, None);
+                }
+                reached_count
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wandering_keeps_reaching_new_waypoints() {
+        // The longest leg, corner to corner of a 960x540 pond's swimming area, takes under
+        // 50 s at cruising speed, so any two minutes of healthy wandering hold at least one
+        // whole leg; healthy koi average 4.5 to 10 waypoints a minute across these ponds
+        // and sizes and reach at least 3 in every two minutes. A koi circling a waypoint
+        // reaches none for minutes on end.
+        const MIN_WAYPOINTS_PER_TWO_MINUTES: usize = 2;
+        for (width_pixels, height_pixels) in [(480.0, 270.0), (960.0, 540.0)] {
+            let pond = Pond {
+                width_pixels,
+                height_pixels,
+                rest_point: [0.0; 2],
+            };
+            for body_length_pixels in [42.0, 99.4, 167.5] {
+                for seed in 0..20 {
+                    for behavior in [Behavior::Cruise, Behavior::Dart] {
+                        let per_minute =
+                            count_waypoints_per_minute(seed, pond, body_length_pixels, behavior);
+                        assert!(
+                            per_minute.windows(2).all(|two_minutes| {
+                                two_minutes[0] + two_minutes[1] >= MIN_WAYPOINTS_PER_TWO_MINUTES
+                            }),
+                            "{behavior:?} L={body_length_pixels} seed {seed} in \
+                             {width_pixels}x{height_pixels}: waypoints per minute {per_minute:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
