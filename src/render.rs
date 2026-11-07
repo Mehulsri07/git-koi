@@ -1087,18 +1087,27 @@ fn sample_koi(
 /// One curve's segment indices, bucketed into a uniform grid of square cells, so a
 /// sample only measures the segments near it.
 ///
-/// Each cell is as wide as the curve's largest half width (at least one pixel), and
-/// lists, in ascending order, every segment whose bounding box, grown by one cell, meets
-/// it. Sampling through the grid gives exactly what `sample_curve` gives over the whole
-/// curve. A sample is kept only if its closest segment lies within that sample's half
-/// width, which is at most the largest half width, the cell size; so whenever the full
-/// scan keeps a sample, its closest segment is listed in the sample's cell, and no
-/// listed segment is closer. Both scans run the same arithmetic over segments in
-/// ascending order and keep the first strict minimum, so ties resolve to the lowest
-/// index in both, and the along fraction counts from the segment's index on the whole
-/// curve. When the full scan keeps nothing, the closest listed segment is no closer
-/// than the true closest, so the grid keeps nothing either; an empty cell or a position
-/// off the grid keeps nothing.
+/// A segment's reach is its wider end's half width: no sample farther than that from
+/// the segment can be kept by it, since a sample is kept only within the half width
+/// interpolated along its closest segment. Each cell is a quarter of the curve's
+/// largest reach (at least one pixel) wide. A cell's own reach is the largest reach of
+/// the segments whose box, grown by their own reach, meets the cell, or zero if there
+/// are none; the cell lists, in ascending order, every segment whose box, grown by the
+/// cell's reach, meets the cell. Growths carry a small slack beyond these reaches, so
+/// rounding never moves a sample out of a box it is inside.
+///
+/// Sampling through the grid gives exactly what `sample_curve` gives over the whole
+/// curve. Both scans run the same arithmetic over segments in ascending order and keep
+/// the first strict minimum, and the along fraction counts from the segment's index on
+/// the whole curve, so it is enough that the grid picks the same segment whenever
+/// either scan keeps a sample. If the full scan keeps a sample, its closest segment
+/// reaches the sample, so the sample's cell has at least that reach and lists the
+/// segment, and no listed segment is closer or ties it at a lower index. If the grid
+/// keeps a sample from some listed segment, that segment reaches the sample, so again
+/// the cell's reach is at least the distance to it, which is at least the distance to
+/// the true closest segment; the cell therefore lists the true closest segment too, and
+/// the grid picks it, which is what the full scan picks and filters. A cell no segment
+/// reaches lists nothing, and a position off the grid keeps nothing.
 struct SegmentGrid {
     segments: Vec<SegmentTerms>,
     /// The curve's last point index, which along fractions divide by.
@@ -1110,9 +1119,9 @@ struct SegmentGrid {
     /// Each cell's listed segments are `segment_indices[cell_starts[cell]..cell_starts[cell + 1]]`.
     cell_starts: Vec<usize>,
     segment_indices: Vec<usize>,
-    /// Past this squared distance from every listed segment, a sample is farther than
-    /// any half width on the curve, so it is not covered.
-    uncovered_squared_distance: f64,
+    /// Past its cell's squared distance from every listed segment, a sample is not
+    /// covered.
+    uncovered_squared_distances: Vec<f64>,
 }
 
 /// Grow a squared distance just enough that every segment whose squared distance is
@@ -1133,55 +1142,110 @@ fn widen_squared_distance(squared_distance_pixels: f64) -> f64 {
 
 impl SegmentGrid {
     fn new(curve_points: &[CurvePoint]) -> Self {
-        // Covers rounding in the distance and the box arithmetic, which could otherwise
-        // leave a sample at exactly the largest half width just outside its segment's
-        // grown box; listing a few more segments never changes a sample.
+        // Covers rounding in the distance, the interpolated half width, and the box
+        // arithmetic, which could otherwise leave a sample at exactly a segment's reach
+        // just outside its grown box; listing a few more segments never changes a sample.
         const ROUNDING_SLACK_PIXELS: f64 = 1e-6;
-        let cell_size_pixels = curve_points
+        // Cells this many to the largest reach list fewer far segments per sample.
+        const CELLS_PER_REACH: f64 = 4.0;
+        // How far from its own box each segment can cover: its wider end's half width.
+        let segment_reaches: Vec<f64> = curve_points
+            .windows(2)
+            .map(|end_points| {
+                end_points[0]
+                    .half_width_pixels
+                    .max(end_points[1].half_width_pixels)
+                    + ROUNDING_SLACK_PIXELS
+            })
+            .collect();
+        let largest_reach_pixels = curve_points
             .iter()
             .map(|curve_point| curve_point.half_width_pixels)
-            .fold(1.0, f64::max);
-        let growth_pixels = cell_size_pixels + ROUNDING_SLACK_PIXELS;
+            .fold(1.0, f64::max)
+            + ROUNDING_SLACK_PIXELS;
+        let cell_size_pixels = largest_reach_pixels / CELLS_PER_REACH;
         let mut origin = [f64::INFINITY; 2];
         let mut far_corner = [f64::NEG_INFINITY; 2];
         for curve_point in curve_points {
             for axis_index in 0..2 {
                 origin[axis_index] =
-                    origin[axis_index].min(curve_point.position[axis_index] - growth_pixels);
-                far_corner[axis_index] =
-                    far_corner[axis_index].max(curve_point.position[axis_index] + growth_pixels);
+                    origin[axis_index].min(curve_point.position[axis_index] - largest_reach_pixels);
+                far_corner[axis_index] = far_corner[axis_index]
+                    .max(curve_point.position[axis_index] + largest_reach_pixels);
             }
         }
         let locate_line = |axis_index: usize, coordinate: f64| {
-            ((coordinate - origin[axis_index]) / cell_size_pixels).floor() as usize
+            ((coordinate - origin[axis_index]) / cell_size_pixels) as usize
         };
         let column_count = locate_line(0, far_corner[0]) + 1;
         let row_count = locate_line(1, far_corner[1]) + 1;
-        // The cells each segment's grown box meets, as inclusive column and row ranges.
-        let segment_cells: Vec<[[usize; 2]; 2]> = curve_points
-            .windows(2)
-            .map(|end_points| {
-                [0, 1].map(|axis_index| {
+        // The cells a segment's box, grown on every side, meets, as inclusive column and
+        // row ranges.
+        let locate_cells = |end_points: &[CurvePoint], growth_pixels: f64| {
+            [0, 1].map(|axis_index| {
+                let [start_coordinate, end_coordinate] = [end_points[0], end_points[1]]
+                    .map(|curve_point| curve_point.position[axis_index]);
+                [
+                    locate_line(
+                        axis_index,
+                        start_coordinate.min(end_coordinate) - growth_pixels,
+                    ),
+                    locate_line(
+                        axis_index,
+                        start_coordinate.max(end_coordinate) + growth_pixels,
+                    ),
+                ]
+            })
+        };
+        // Each cell's reach: the largest reach of the segments that can cover any of it,
+        // or zero where none can.
+        let mut cell_reaches = vec![0.0_f64; column_count * row_count];
+        for (end_points, &segment_reach) in curve_points.windows(2).zip(&segment_reaches) {
+            let [[first_column, last_column], [first_row, last_row]] =
+                locate_cells(end_points, segment_reach);
+            for row in first_row..=last_row {
+                for column in first_column..=last_column {
+                    let cell_reach = &mut cell_reaches[row * column_count + column];
+                    *cell_reach = cell_reach.max(segment_reach);
+                }
+            }
+        }
+        // A cell lists each segment whose box, grown by the cell's reach, meets the cell's
+        // own box. The test runs on coordinates rather than cell lines, with a second
+        // slack that outweighs the rounding of locating a sample's cell, so every sample
+        // a grown box holds has its cell list that segment.
+        let is_listed = |end_points: &[CurvePoint], row: usize, column: usize| {
+            let cell_reach = cell_reaches[row * column_count + column];
+            if cell_reach == 0.0 {
+                return false;
+            }
+            let growth_pixels = cell_reach + ROUNDING_SLACK_PIXELS;
+            [(0, column), (1, row)]
+                .into_iter()
+                .all(|(axis_index, cell_line)| {
                     let [start_coordinate, end_coordinate] = [end_points[0], end_points[1]]
                         .map(|curve_point| curve_point.position[axis_index]);
-                    [
-                        locate_line(
-                            axis_index,
-                            start_coordinate.min(end_coordinate) - growth_pixels,
-                        ),
-                        locate_line(
-                            axis_index,
-                            start_coordinate.max(end_coordinate) + growth_pixels,
-                        ),
-                    ]
+                    let cell_start = origin[axis_index] + cell_line as f64 * cell_size_pixels;
+                    start_coordinate.min(end_coordinate) - growth_pixels
+                        <= cell_start + cell_size_pixels
+                        && start_coordinate.max(end_coordinate) + growth_pixels >= cell_start
                 })
-            })
+        };
+        // Every listed segment is among these, the cells its box grown by the largest
+        // reach meets.
+        let segment_cells: Vec<[[usize; 2]; 2]> = curve_points
+            .windows(2)
+            .map(|end_points| locate_cells(end_points, largest_reach_pixels))
             .collect();
         let mut cell_starts = vec![0; column_count * row_count + 1];
-        for [[first_column, last_column], [first_row, last_row]] in &segment_cells {
+        for (end_points, [[first_column, last_column], [first_row, last_row]]) in
+            curve_points.windows(2).zip(&segment_cells)
+        {
             for row in *first_row..=*last_row {
                 for column in *first_column..=*last_column {
-                    cell_starts[row * column_count + column + 1] += 1;
+                    if is_listed(end_points, row, column) {
+                        cell_starts[row * column_count + column + 1] += 1;
+                    }
                 }
             }
         }
@@ -1191,14 +1255,16 @@ impl SegmentGrid {
         let mut next_slots = cell_starts.clone();
         let mut segment_indices = vec![0; cell_starts[cell_starts.len() - 1]];
         // Segments go in ascending order, so every cell lists them ascending.
-        for (segment_index, [[first_column, last_column], [first_row, last_row]]) in
-            segment_cells.iter().enumerate()
+        for (segment_index, (end_points, [[first_column, last_column], [first_row, last_row]])) in
+            curve_points.windows(2).zip(&segment_cells).enumerate()
         {
             for row in *first_row..=*last_row {
                 for column in *first_column..=*last_column {
-                    let next_slot = &mut next_slots[row * column_count + column];
-                    segment_indices[*next_slot] = segment_index;
-                    *next_slot += 1;
+                    if is_listed(end_points, row, column) {
+                        let next_slot = &mut next_slots[row * column_count + column];
+                        segment_indices[*next_slot] = segment_index;
+                        *next_slot += 1;
+                    }
                 }
             }
         }
@@ -1214,17 +1280,19 @@ impl SegmentGrid {
             row_count,
             cell_starts,
             segment_indices,
-            // Every half width on the curve, interpolated or not, is at most the cell
-            // size up to rounding, and a segment beyond this has a `hypot` distance
-            // greater than the cell size by far more than that rounding.
-            uncovered_squared_distance: widen_squared_distance(cell_size_pixels.powi(2)),
+            // A segment beyond this from a sample in the cell has a `hypot` distance
+            // greater than the cell's reach by far more than rounding, so it is farther
+            // than any half width of a segment that could cover the sample.
+            uncovered_squared_distances: cell_reaches
+                .iter()
+                .map(|cell_reach| widen_squared_distance(cell_reach.powi(2)))
+                .collect(),
         }
     }
 
     fn sample(&self, sample_position: [f64; 2]) -> Option<CurveSample> {
         let [column, row] = [0, 1].map(|axis_index| {
-            ((sample_position[axis_index] - self.origin[axis_index]) / self.cell_size_pixels)
-                .floor()
+            (sample_position[axis_index] - self.origin[axis_index]) / self.cell_size_pixels
         });
         if !(0.0..self.column_count as f64).contains(&column)
             || !(0.0..self.row_count as f64).contains(&row)
@@ -1255,7 +1323,7 @@ impl SegmentGrid {
             .iter()
             .map(|&segment_index| square_distance(measure_segment(&self.segments[segment_index]).3))
             .fold(f64::INFINITY, f64::min);
-        if closest_squared_distance > self.uncovered_squared_distance {
+        if closest_squared_distance > self.uncovered_squared_distances[cell_index] {
             return None;
         }
         let candidate_limit = widen_squared_distance(closest_squared_distance);
