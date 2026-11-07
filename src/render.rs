@@ -17,6 +17,7 @@
 //! Anatomical proportions live here; pigments, bodies, and palettes in [`crate::coat`];
 //! streak mark strengths in [`crate::markings`]; poses in [`crate::motion`].
 
+use std::cell::OnceCell;
 use std::f64::consts::{PI, TAU};
 
 use crate::behavior::Behavior;
@@ -57,15 +58,10 @@ impl KoiFrame {
 /// not reroll the pattern. Streak marks follow the development's streaks as of its
 /// observation date. Identical inputs produce identical pixels without I/O, clock
 /// reads, or input mutation.
+///
+/// This is [`KoiRenderer::render_still`] on a renderer built for this one call.
 pub fn render_koi(koi_development: &KoiDevelopment, koi_body: KoiBody) -> KoiFrame {
-    let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
-    render_pose(
-        koi_development,
-        koi_body,
-        &koi_anatomy,
-        &STILL_POSE,
-        Framing::CenterOnKoi,
-    )
+    KoiRenderer::new(koi_development, koi_body).render_still()
 }
 
 /// Render one frame of a behavior's seamless loop, colored like `render_koi`, in the
@@ -76,31 +72,102 @@ pub fn render_koi(koi_development: &KoiDevelopment, koi_body: KoiBody) -> KoiFra
 /// stay inside. The view never follows the fins, so it never shakes. Under water the koi
 /// turns toward water blue and partly drops out, more with depth. Identical inputs
 /// produce identical pixels without I/O, clock reads, or input mutation.
+///
+/// This is [`KoiRenderer::render_swim_frame`] on a renderer built for this one call;
+/// callers that draw many frames of one koi should keep a [`KoiRenderer`] instead.
 pub fn render_swim_frame(
     koi_development: &KoiDevelopment,
     koi_body: KoiBody,
     behavior: Behavior,
     frame_index: u32,
 ) -> KoiFrame {
-    let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
-    let swim_pose = calculate_swim_pose(behavior, frame_index);
-    let pose_center = match swim_pose.course {
-        Course::Lap { .. } => [0.0, 0.0],
-        Course::Hover { drift_pixels, .. } => {
-            let hover_fit = fit_hover_loop(behavior, &koi_anatomy);
-            [0, 1].map(|axis_index| {
-                hover_fit.sweep_center[axis_index]
-                    - hover_fit.drift_scales[axis_index] * drift_pixels[axis_index]
-            })
+    KoiRenderer::new(koi_development, koi_body).render_swim_frame(behavior, frame_index)
+}
+
+/// One koi's frame-independent setup, kept so that drawing many frames of the same koi
+/// pays for it once: its anatomy, its coat (the fitted pigment patches, spots, and
+/// streak marks), and the framing of each hovering behavior's loop.
+///
+/// Every frame it draws has exactly the pixels [`render_koi`] and [`render_swim_frame`]
+/// give for the same development and body; those functions are this renderer, built for
+/// a single call. The renderer owns everything it keeps, so it does not borrow the
+/// development and can live across many frames, as in an animation loop. A later change
+/// to the development does not reach it; build a new renderer for a changed koi.
+///
+/// A hovering behavior's framing is fitted over its whole loop the first time one of
+/// its frames is drawn, then reused for every later frame; lap behaviors never need one.
+/// The renderer is [`Send`] but not [`Sync`], because that lazy fit is kept in a
+/// [`OnceCell`].
+pub struct KoiRenderer {
+    koi_body: KoiBody,
+    koi_anatomy: KoiAnatomy,
+    koi_coat: KoiCoat,
+    /// Each behavior's hover framing once fitted, indexed by [`behavior_slot`].
+    hover_fits: [OnceCell<HoverFit>; BEHAVIOR_COUNT],
+}
+
+impl KoiRenderer {
+    /// Prepare to draw the koi `koi_development` grows into, on the chosen body: its
+    /// anatomy and coat are computed now, from the development as it is now.
+    pub fn new(koi_development: &KoiDevelopment, koi_body: KoiBody) -> Self {
+        let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
+        let koi_coat = KoiCoat::new(koi_development, koi_body, |along_fraction| {
+            calculate_body_half_width(along_fraction, &koi_anatomy)
+        });
+        Self {
+            koi_body,
+            koi_anatomy,
+            koi_coat,
+            hover_fits: Default::default(),
         }
-    };
-    render_pose(
-        koi_development,
-        koi_body,
-        &koi_anatomy,
-        &swim_pose,
-        Framing::At(pose_center),
-    )
+    }
+
+    /// The still image: the same pixels as [`render_koi`] for this renderer's
+    /// development and body.
+    pub fn render_still(&self) -> KoiFrame {
+        self.render_pose(&STILL_POSE, Framing::CenterOnKoi)
+    }
+
+    /// One frame of `behavior`'s loop: the same pixels as [`render_swim_frame`] for
+    /// this renderer's development and body. Frame numbers wrap around the loop.
+    pub fn render_swim_frame(&self, behavior: Behavior, frame_index: u32) -> KoiFrame {
+        let swim_pose = calculate_swim_pose(behavior, frame_index);
+        let pose_center = match swim_pose.course {
+            Course::Lap { .. } => [0.0, 0.0],
+            Course::Hover { drift_pixels, .. } => {
+                let hover_fit = self.hover_fits[behavior_slot(behavior)]
+                    .get_or_init(|| fit_hover_loop(behavior, &self.koi_anatomy));
+                [0, 1].map(|axis_index| {
+                    hover_fit.sweep_center[axis_index]
+                        - hover_fit.drift_scales[axis_index] * drift_pixels[axis_index]
+                })
+            }
+        };
+        self.render_pose(&swim_pose, Framing::At(pose_center))
+    }
+
+    fn render_pose(&self, swim_pose: &SwimPose, framing: Framing) -> KoiFrame {
+        render_pose(
+            &self.koi_coat,
+            self.koi_body,
+            &self.koi_anatomy,
+            swim_pose,
+            framing,
+        )
+    }
+}
+
+const BEHAVIOR_COUNT: usize = 5;
+
+/// Each behavior's own index into [`KoiRenderer`]'s hover fits.
+fn behavior_slot(behavior: Behavior) -> usize {
+    match behavior {
+        Behavior::DeepRest => 0,
+        Behavior::Rest => 1,
+        Behavior::SurfaceFeeding => 2,
+        Behavior::Dart => 3,
+        Behavior::Cruise => 4,
+    }
 }
 
 /// Where the view is centered: on the koi itself for the still image, or at a point
@@ -183,15 +250,12 @@ fn fit_hover_loop(behavior: Behavior, koi_anatomy: &KoiAnatomy) -> HoverFit {
 }
 
 fn render_pose(
-    koi_development: &KoiDevelopment,
+    koi_coat: &KoiCoat,
     koi_body: KoiBody,
     koi_anatomy: &KoiAnatomy,
     swim_pose: &SwimPose,
     framing: Framing,
 ) -> KoiFrame {
-    let koi_coat = KoiCoat::new(koi_development, koi_body, |along_fraction| {
-        calculate_body_half_width(along_fraction, koi_anatomy)
-    });
     let body_spine = build_spine(koi_anatomy, swim_pose);
     let fin_curves = build_fins(&body_spine, koi_anatomy, swim_pose);
     let [min_corner, max_corner] = measure_curve_bounds(&body_spine, &fin_curves);
@@ -204,7 +268,7 @@ fn render_pose(
     };
     let koi_appearance = KoiAppearance {
         koi_anatomy,
-        koi_coat: &koi_coat,
+        koi_coat,
     };
     let body_grid = SegmentGrid::new(&body_spine);
     let fin_grids: Vec<SegmentGrid> = fin_curves

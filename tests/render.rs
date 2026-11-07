@@ -12,7 +12,7 @@ use git_koi::koi::{
 use git_koi::motion::frame_count;
 use git_koi::output::encode_png;
 use git_koi::render::{
-    FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, KoiFrame, render_koi, render_swim_frame,
+    FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, KoiFrame, KoiRenderer, render_koi, render_swim_frame,
 };
 
 type LanguageMix<'a> = &'a [(&'a str, Option<&'a str>, f64)];
@@ -546,6 +546,40 @@ fn quiet_days_change_streak_state_without_changing_the_anatomy() {
         .zip(quiet_frame.as_rgba_bytes().as_chunks::<4>().0.iter())
     {
         assert_eq!(active_pixel[3], quiet_pixel[3]);
+    }
+}
+
+#[test]
+fn cached_renderer_matches_free_functions() {
+    let mut koi_development = read_fixture_development();
+    for total_contributions in [14, 100_000] {
+        koi_development.total_contributions = total_contributions;
+        // One renderer serves every behavior and frame, so its cached setup is reused.
+        let koi_renderer = KoiRenderer::new(&koi_development, KoiBody::default());
+        for behavior in [
+            Behavior::DeepRest,
+            Behavior::Rest,
+            Behavior::SurfaceFeeding,
+            Behavior::Dart,
+            Behavior::Cruise,
+        ] {
+            for frame_index in [0, 7, 33] {
+                assert!(
+                    koi_renderer.render_swim_frame(behavior, frame_index)
+                        == render_swim_frame(
+                            &koi_development,
+                            KoiBody::default(),
+                            behavior,
+                            frame_index
+                        ),
+                    "total {total_contributions}, {behavior:?}, frame {frame_index}"
+                );
+            }
+        }
+        assert!(
+            koi_renderer.render_still() == render_koi(&koi_development, KoiBody::default()),
+            "total {total_contributions}, still"
+        );
     }
 }
 

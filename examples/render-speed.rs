@@ -1,5 +1,6 @@
 //! Time `render_swim_frame` per frame across growth, for the koi pond that renders every
-//! animation frame. Run with `cargo run --release --locked --example render-speed`.
+//! animation frame, both as one call per frame and through a `KoiRenderer` built once
+//! and kept across frames. Run with `cargo run --release --locked --example render-speed`.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -8,7 +9,7 @@ use git_koi::behavior::Behavior;
 use git_koi::coat::KoiBody;
 use git_koi::history::AccountSnapshot;
 use git_koi::koi::derive_koi_development;
-use git_koi::render::render_swim_frame;
+use git_koi::render::{KoiRenderer, render_swim_frame};
 
 const GROWTH_TOTALS: [u64; 4] = [14, 1_500, 12_750, 100_000];
 const BEHAVIORS: [(Behavior, &str); 2] = [(Behavior::Cruise, "Cruise"), (Behavior::Rest, "Rest")];
@@ -42,6 +43,17 @@ fn main() {
                 started_at.elapsed().as_secs_f64() * 1_000.0 / f64::from(TIMED_FRAME_COUNT);
             println!(
                 "total={total_contributions} {behavior_name}: {frame_milliseconds:.2} ms/frame"
+            );
+            let koi_renderer = KoiRenderer::new(&koi_development, KoiBody::default());
+            black_box(koi_renderer.render_swim_frame(behavior, 0));
+            let started_at = Instant::now();
+            for frame_index in 0..TIMED_FRAME_COUNT {
+                black_box(black_box(&koi_renderer).render_swim_frame(behavior, frame_index));
+            }
+            let frame_milliseconds =
+                started_at.elapsed().as_secs_f64() * 1_000.0 / f64::from(TIMED_FRAME_COUNT);
+            println!(
+                "cached total={total_contributions} {behavior_name}: {frame_milliseconds:.2} ms/frame"
             );
         }
     }
