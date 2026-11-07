@@ -1110,6 +1110,25 @@ struct SegmentGrid {
     /// Each cell's listed segments are `segment_indices[cell_starts[cell]..cell_starts[cell + 1]]`.
     cell_starts: Vec<usize>,
     segment_indices: Vec<usize>,
+    /// Past this squared distance from every listed segment, a sample is farther than
+    /// any half width on the curve, so it is not covered.
+    uncovered_squared_distance: f64,
+}
+
+/// Grow a squared distance just enough that every segment whose squared distance is
+/// beyond the result has a `hypot` distance strictly greater than the `hypot` distance
+/// of a segment at the given squared distance.
+///
+/// Squaring and summing the two offsets rounds by a few parts in 2^53, and `hypot` is
+/// within one unit in the last place, so a relative margin of 2^-30 is far more than
+/// their combined error can close; the added smallest normal value outweighs the
+/// absolute rounding of products that underflow. Sampling uses this to skip `hypot` on
+/// segments that cannot be the closest, which leaves every sample exactly as
+/// `sample_curve` gives it: the closest `hypot` distance and the lowest index reaching
+/// it are both found among the segments it keeps.
+fn widen_squared_distance(squared_distance_pixels: f64) -> f64 {
+    const RELATIVE_MARGIN: f64 = 1.0 / (1_u64 << 30) as f64;
+    squared_distance_pixels * (1.0 + RELATIVE_MARGIN) + f64::MIN_POSITIVE
 }
 
 impl SegmentGrid {
@@ -1195,6 +1214,10 @@ impl SegmentGrid {
             row_count,
             cell_starts,
             segment_indices,
+            // Every half width on the curve, interpolated or not, is at most the cell
+            // size up to rounding, and a segment beyond this has a `hypot` distance
+            // greater than the cell size by far more than that rounding.
+            uncovered_squared_distance: widen_squared_distance(cell_size_pixels.powi(2)),
         }
     }
 
@@ -1211,20 +1234,44 @@ impl SegmentGrid {
         let cell_index = row as usize * self.column_count + column as usize;
         let listed_segments =
             &self.segment_indices[self.cell_starts[cell_index]..self.cell_starts[cell_index + 1]];
-        // The arithmetic and tie rule of `sample_curve`, over the listed segments only,
-        // with each segment's own terms computed once per frame by the same expressions.
-        let mut closest_sample = None;
-        let mut closest_distance_pixels = f64::INFINITY;
-        for &segment_index in listed_segments {
-            let segment = &self.segments[segment_index];
+        // The offset from a segment's closest point, by the arithmetic of `sample_curve`.
+        let measure_segment = |segment: &SegmentTerms| {
             let [segment_x, segment_y] = segment.direction;
             let offset_x = sample_position[0] - segment.start_position[0];
             let offset_y = sample_position[1] - segment.start_position[1];
             let segment_progress = ((offset_x * segment_x + offset_y * segment_y)
                 / segment.squared_length_pixels)
                 .clamp(0.0, 1.0);
-            let distance_pixels = (offset_x - segment_progress * segment_x)
-                .hypot(offset_y - segment_progress * segment_y);
+            let closest_offset = [
+                offset_x - segment_progress * segment_x,
+                offset_y - segment_progress * segment_y,
+            ];
+            (offset_x, offset_y, segment_progress, closest_offset)
+        };
+        let square_distance =
+            |closest_offset: [f64; 2]| closest_offset[0].powi(2) + closest_offset[1].powi(2);
+        // First, the smallest squared distance, which needs no `hypot`.
+        let closest_squared_distance = listed_segments
+            .iter()
+            .map(|&segment_index| square_distance(measure_segment(&self.segments[segment_index]).3))
+            .fold(f64::INFINITY, f64::min);
+        if closest_squared_distance > self.uncovered_squared_distance {
+            return None;
+        }
+        let candidate_limit = widen_squared_distance(closest_squared_distance);
+        // Then the arithmetic and tie rule of `sample_curve`, over the listed segments
+        // that could be closest, with each segment's own terms computed once per frame
+        // by the same expressions.
+        let mut closest_sample = None;
+        let mut closest_distance_pixels = f64::INFINITY;
+        for &segment_index in listed_segments {
+            let segment = &self.segments[segment_index];
+            let [segment_x, segment_y] = segment.direction;
+            let (offset_x, offset_y, segment_progress, closest_offset) = measure_segment(segment);
+            if square_distance(closest_offset) > candidate_limit {
+                continue;
+            }
+            let distance_pixels = closest_offset[0].hypot(closest_offset[1]);
             if distance_pixels >= closest_distance_pixels {
                 continue;
             }
