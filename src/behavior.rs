@@ -17,6 +17,35 @@ pub enum Behavior {
     Cruise,
 }
 
+/// Why the koi moves as it does: the first rule that matched, with its evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BehaviorReason {
+    /// The observation date ends at least the deep-rest threshold of quiet days.
+    DeepRest {
+        /// Consecutive quiet days ending on the observation date.
+        quiet_days: u32,
+    },
+    /// The observation date ends at least the rest threshold of quiet days.
+    Rest {
+        /// Consecutive quiet days ending on the observation date.
+        quiet_days: u32,
+    },
+    /// The observation date is the first day with contributions in its week.
+    FirstContributionOfWeek,
+    /// The total crossed a milestone within the last seven days.
+    CrossedMilestone {
+        /// The milestone crossed; the largest when several were.
+        milestone: u64,
+    },
+    /// The observation date finishes a busy week.
+    BusyWeek {
+        /// Contributions in the finished week.
+        week_contributions: u64,
+    },
+    /// No other rule matched.
+    Steady,
+}
+
 const DEEP_REST_QUIET_DAYS: u32 = 60;
 const REST_QUIET_DAYS: u32 = 14;
 /// Totals whose crossing earns a week of darting.
@@ -48,19 +77,37 @@ const DAYS_PER_WEEK: usize = 7;
 /// and the koi darts at most one day a week beyond milestones. This reads no clock
 /// and changes no growth, colors, or marks.
 pub fn select_behavior(koi_development: &KoiDevelopment) -> Behavior {
+    explain_behavior(koi_development).0
+}
+
+/// Choose the movement as `select_behavior` does, and say which rule chose it. The
+/// two share this one rule path, so `select_behavior(d)` is `explain_behavior(d).0`.
+pub fn explain_behavior(koi_development: &KoiDevelopment) -> (Behavior, BehaviorReason) {
     let recent_activity = &koi_development.recent_activity;
-    if recent_activity.quiet_day_count >= DEEP_REST_QUIET_DAYS {
-        Behavior::DeepRest
-    } else if recent_activity.quiet_day_count >= REST_QUIET_DAYS {
-        Behavior::Rest
+    let quiet_days = recent_activity.quiet_day_count;
+    if quiet_days >= DEEP_REST_QUIET_DAYS {
+        (Behavior::DeepRest, BehaviorReason::DeepRest { quiet_days })
+    } else if quiet_days >= REST_QUIET_DAYS {
+        (Behavior::Rest, BehaviorReason::Rest { quiet_days })
     } else if is_first_contribution_of_week(recent_activity) {
-        Behavior::SurfaceFeeding
-    } else if has_crossed_milestone(koi_development.total_contributions, recent_activity)
-        || is_finished_busy_week(recent_activity)
+        (
+            Behavior::SurfaceFeeding,
+            BehaviorReason::FirstContributionOfWeek,
+        )
+    } else if let Some(milestone) =
+        crossed_milestone(koi_development.total_contributions, recent_activity)
     {
-        Behavior::Dart
+        (
+            Behavior::Dart,
+            BehaviorReason::CrossedMilestone { milestone },
+        )
+    } else if let Some(week_contributions) = finished_busy_week_total(recent_activity) {
+        (
+            Behavior::Dart,
+            BehaviorReason::BusyWeek { week_contributions },
+        )
     } else {
-        Behavior::Cruise
+        (Behavior::Cruise, BehaviorReason::Steady)
     }
 }
 
@@ -72,14 +119,16 @@ fn is_first_contribution_of_week(recent_activity: &RecentActivity) -> bool {
     )
 }
 
-fn has_crossed_milestone(total_contributions: u64, recent_activity: &RecentActivity) -> bool {
+fn crossed_milestone(total_contributions: u64, recent_activity: &RecentActivity) -> Option<u64> {
     let earlier_total = total_contributions.saturating_sub(recent_activity.recent_contributions);
     DART_MILESTONES
         .iter()
-        .any(|&milestone| earlier_total < milestone && milestone <= total_contributions)
+        .rev()
+        .copied()
+        .find(|&milestone| earlier_total < milestone && milestone <= total_contributions)
 }
 
-fn is_finished_busy_week(recent_activity: &RecentActivity) -> bool {
+fn finished_busy_week_total(recent_activity: &RecentActivity) -> Option<u64> {
     let finished_week = &recent_activity.observation_week_contributions;
     let complete_weeks = &recent_activity.complete_week_contributions;
     let compared_weeks =
@@ -89,7 +138,8 @@ fn is_finished_busy_week(recent_activity: &RecentActivity) -> bool {
         .iter()
         .filter(|&&week_contributions| week_contributions >= week_total)
         .count();
-    finished_week.len() == DAYS_PER_WEEK
+    let is_busy = finished_week.len() == DAYS_PER_WEEK
         && compared_weeks.len() >= DART_MIN_COMPLETE_WEEKS
-        && matching_week_count * DART_WEEK_SHARE_DENOMINATOR <= compared_weeks.len()
+        && matching_week_count * DART_WEEK_SHARE_DENOMINATOR <= compared_weeks.len();
+    is_busy.then_some(week_total)
 }

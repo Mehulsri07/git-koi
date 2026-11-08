@@ -1,5 +1,5 @@
 use chrono::{Days, NaiveDate};
-use git_koi::behavior::{Behavior, select_behavior};
+use git_koi::behavior::{Behavior, BehaviorReason, explain_behavior, select_behavior};
 use git_koi::history::{AccountSnapshot, ContributionDay, ContributionHistory};
 use git_koi::koi::{KoiDevelopment, derive_koi_development};
 
@@ -156,6 +156,55 @@ fn quiet_days_change_behavior_only_at_the_thresholds_and_nothing_else() {
     assert_eq!(
         select_behavior(&develop_from_daily_counts(&returning_counts)),
         Behavior::SurfaceFeeding
+    );
+}
+
+#[test]
+fn each_rule_explains_itself() {
+    let steady_weeks = vec![1; 20 * 7];
+    let explain_counts =
+        |daily_counts: &[u32]| explain_behavior(&develop_from_daily_counts(daily_counts));
+    assert_eq!(
+        explain_counts(&[steady_weeks.clone(), vec![0; 70]].concat()),
+        (
+            Behavior::DeepRest,
+            BehaviorReason::DeepRest { quiet_days: 70 }
+        )
+    );
+    assert_eq!(
+        explain_counts(&[steady_weeks.clone(), vec![0; 14]].concat()),
+        (Behavior::Rest, BehaviorReason::Rest { quiet_days: 14 })
+    );
+    assert_eq!(
+        explain_counts(&[steady_weeks.clone(), vec![0, 0, 3]].concat()),
+        (
+            Behavior::SurfaceFeeding,
+            BehaviorReason::FirstContributionOfWeek
+        )
+    );
+    let busy_weeks = vec![7; 20 * 7];
+    assert_eq!(
+        explain_counts(&[busy_weeks, vec![3; 7]].concat()),
+        (
+            Behavior::Dart,
+            BehaviorReason::CrossedMilestone { milestone: 1_000 }
+        )
+    );
+    let ranked_weeks: Vec<u32> = (1..=20)
+        .flat_map(|week_total| [0, 0, week_total, 0, 0, 0, 0])
+        .collect();
+    assert_eq!(
+        explain_counts(&[ranked_weeks, vec![18, 0, 0, 0, 0, 0, 1]].concat()),
+        (
+            Behavior::Dart,
+            BehaviorReason::BusyWeek {
+                week_contributions: 19
+            }
+        )
+    );
+    assert_eq!(
+        explain_counts(&[steady_weeks, vec![1; 3]].concat()),
+        (Behavior::Cruise, BehaviorReason::Steady)
     );
 }
 
