@@ -28,6 +28,7 @@ fn owned(repository_id: u64, owner_commit_count: u64) -> OwnedRepository {
     OwnedRepository {
         repository_id,
         owner_commit_count,
+        name_with_owner: format!("octo/repo-{repository_id}"),
     }
 }
 

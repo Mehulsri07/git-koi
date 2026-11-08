@@ -63,7 +63,7 @@ const ACCOUNT_QUERY: &str =
 const REPOSITORY_FIELDS: &str = "nodes { databaseId visibility isFork primaryLanguage { name color } } pageInfo { hasNextPage endCursor }";
 /// Owned repositories also count the owner's commits on the default branch; a
 /// repository without a default branch (empty) has `defaultBranchRef: null`.
-const OWNED_REPOSITORY_FIELDS: &str = "nodes { databaseId visibility isFork primaryLanguage { name color } \
+const OWNED_REPOSITORY_FIELDS: &str = "nodes { databaseId nameWithOwner visibility isFork primaryLanguage { name color } \
     defaultBranchRef { target { ... on Commit { history(author: { id: $userId }) { totalCount } } } } } \
     pageInfo { hasNextPage endCursor }";
 const CALENDAR_QUERY: &str = "query($login: String!, $from: DateTime!, $to: DateTime!) { \
@@ -183,6 +183,7 @@ fn collect_repositories(
                 owned_repositories.push(OwnedRepository {
                     repository_id: repository.repository_id,
                     owner_commit_count: read_owner_commit_count(repository_node)?,
+                    name_with_owner: read_str(repository_node, "nameWithOwner")?.to_owned(),
                 });
             }
             repositories.push(repository);

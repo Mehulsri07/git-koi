@@ -392,16 +392,35 @@ fn version_4_round_trips_owned_repositories() {
         OwnedRepository {
             repository_id: 7,
             owner_commit_count: 120,
+            name_with_owner: "Mehulsri07/StrataField".to_owned(),
         },
         OwnedRepository {
             repository_id: 9,
             owner_commit_count: 0,
+            name_with_owner: "Mehulsri07/git-koi".to_owned(),
         },
     ]);
     let snapshot_document = serde_json::to_value(&account_snapshot).unwrap();
     assert_eq!(snapshot_document["schema_version"], 4);
     let restored_snapshot: AccountSnapshot = serde_json::from_value(snapshot_document).unwrap();
     assert_eq!(restored_snapshot, account_snapshot);
+}
+
+#[test]
+fn version_4_needs_names_for_owned_repositories() {
+    let mut account_snapshot: AccountSnapshot =
+        serde_json::from_str(ACCOUNT_WITH_HISTORY_JSON).unwrap();
+    account_snapshot.owned_repositories = Some(vec![OwnedRepository {
+        repository_id: 7,
+        owner_commit_count: 120,
+        name_with_owner: "Mehulsri07/StrataField".to_owned(),
+    }]);
+    let mut snapshot_document = serde_json::to_value(&account_snapshot).unwrap();
+    snapshot_document["owned_repositories"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("name_with_owner");
+    assert!(serde_json::from_value::<AccountSnapshot>(snapshot_document).is_err());
 }
 
 #[test]

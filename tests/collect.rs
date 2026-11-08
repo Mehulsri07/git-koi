@@ -74,11 +74,13 @@ fn collection_records_owner_commits_for_owned_public_repositories() {
         Some(vec![
             OwnedRepository {
                 repository_id: 10,
-                owner_commit_count: 7
+                owner_commit_count: 7,
+                name_with_owner: "octo/repo-10".to_owned()
             },
             OwnedRepository {
                 repository_id: 20,
-                owner_commit_count: 95
+                owner_commit_count: 95,
+                name_with_owner: "octo/repo-20".to_owned()
             },
         ])
     );
@@ -95,7 +97,8 @@ fn an_owned_repository_without_a_default_branch_has_no_commits() {
         account_snapshot.owned_repositories,
         Some(vec![OwnedRepository {
             repository_id: 10,
-            owner_commit_count: 0
+            owner_commit_count: 0,
+            name_with_owner: "octo/repo-10".to_owned()
         }])
     );
 }
@@ -414,6 +417,7 @@ fn repository_node(repository_id: u64, is_fork: bool, language: Option<&str>) ->
     };
     json!({
         "databaseId": repository_id,
+        "nameWithOwner": format!("octo/repo-{repository_id}"),
         "visibility": "PUBLIC",
         "isFork": is_fork,
         "primaryLanguage": language.map(|name| json!({ "name": name, "color": language_color(name) })),

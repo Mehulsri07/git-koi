@@ -32,7 +32,7 @@ pub struct AccountSnapshot {
     pub owned_repositories: Option<Vec<OwnedRepository>>,
 }
 
-/// The account owner's commit count in one repository the account owns.
+/// The account owner's commit count, and the name, of one repository the account owns.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnedRepository {
@@ -40,6 +40,8 @@ pub struct OwnedRepository {
     pub repository_id: u64,
     /// How many commits the account owner authored in the repository.
     pub owner_commit_count: u64,
+    /// The repository's `owner/name`, as GitHub writes it.
+    pub name_with_owner: String,
 }
 
 /// A GitHub language color, written as `#rrggbb`.
