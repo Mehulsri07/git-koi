@@ -1,5 +1,5 @@
 //! Where the lilypads float: one pad per owned public repository, laid out
-//! deterministically on a fixed-size pond.
+//! deterministically on a pond of any size.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -9,10 +9,6 @@ use crate::history::{
     AccountSnapshot, ConflictingRepository, RepositoryObservation, RepositoryVisibility,
 };
 
-/// Width of the pond in native pixels.
-pub const POND_WIDTH_PIXELS: u32 = 416;
-/// Height of the pond in native pixels.
-pub const POND_HEIGHT_PIXELS: u32 = 192;
 /// The most pads a pond holds.
 pub const MAX_PADS: usize = 12;
 
@@ -132,8 +128,13 @@ struct Candidate<'a> {
 /// The layout depends only on the snapshot: the same snapshot always gives the
 /// same pond. Adding a size-one repository with the highest ID among size-one
 /// pads, so it is placed last, is the only change guaranteed not to move other
-/// pads. This operation performs no I/O.
-pub fn layout_pond(account_snapshot: &AccountSnapshot) -> Result<PondLayout, PondError> {
+/// pads. The pond is `pond_width_pixels` by `pond_height_pixels` native pixels,
+/// and every pad lies wholly inside it. This operation performs no I/O.
+pub fn layout_pond(
+    account_snapshot: &AccountSnapshot,
+    pond_width_pixels: u32,
+    pond_height_pixels: u32,
+) -> Result<PondLayout, PondError> {
     let owned_repositories = account_snapshot
         .owned_repositories
         .as_ref()
@@ -191,7 +192,12 @@ pub fn layout_pond(account_snapshot: &AccountSnapshot) -> Result<PondLayout, Pon
 
     let mut pads: Vec<Pad> = Vec::new();
     for candidate in &candidates {
-        if let Some((center, size)) = place(account_snapshot.account_id, candidate, &pads) {
+        if let Some((center, size)) = place(
+            account_snapshot.account_id,
+            candidate,
+            &pads,
+            [pond_width_pixels, pond_height_pixels],
+        ) {
             pads.push(Pad {
                 repository_id: candidate.repository_id,
                 center,
@@ -245,7 +251,12 @@ fn assign_blooms(candidates: &mut [Candidate]) {
     }
 }
 
-fn place(account_id: u64, candidate: &Candidate, placed: &[Pad]) -> Option<([f64; 2], PadSize)> {
+fn place(
+    account_id: u64,
+    candidate: &Candidate,
+    placed: &[Pad],
+    pond_pixels: [u32; 2],
+) -> Option<([f64; 2], PadSize)> {
     let mut size = candidate.size;
     loop {
         let radius = size.radius_pixels();
@@ -268,15 +279,24 @@ fn place(account_id: u64, candidate: &Candidate, placed: &[Pad]) -> Option<([f64
                     ]
                 }
                 _ => {
-                    let width = u64::from(POND_WIDTH_PIXELS) - 2 * radius as u64;
-                    let height = u64::from(POND_HEIGHT_PIXELS) - 2 * radius as u64;
+                    // A pond too small for this size leaves no room: try a smaller pad.
+                    let diameter = 2 * radius as u64;
+                    let (Some(width), Some(height)) = (
+                        u64::from(pond_pixels[0]).checked_sub(diameter),
+                        u64::from(pond_pixels[1]).checked_sub(diameter),
+                    ) else {
+                        break;
+                    };
+                    if width == 0 || height == 0 {
+                        break;
+                    }
                     [
                         radius + (hash % width) as f64,
                         radius + ((hash >> 32) % height) as f64,
                     ]
                 }
             };
-            if fits(center, radius, placed) {
+            if fits(center, radius, placed, pond_pixels) {
                 return Some((center, size));
             }
         }
@@ -284,11 +304,11 @@ fn place(account_id: u64, candidate: &Candidate, placed: &[Pad]) -> Option<([f64
     }
 }
 
-fn fits(center: [f64; 2], radius: f64, placed: &[Pad]) -> bool {
+fn fits(center: [f64; 2], radius: f64, placed: &[Pad], pond_pixels: [u32; 2]) -> bool {
     let inside = center[0] - radius >= 0.0
-        && center[0] + radius <= f64::from(POND_WIDTH_PIXELS)
+        && center[0] + radius <= f64::from(pond_pixels[0])
         && center[1] - radius >= 0.0
-        && center[1] + radius <= f64::from(POND_HEIGHT_PIXELS);
+        && center[1] + radius <= f64::from(pond_pixels[1]);
     inside
         && placed.iter().all(|pad| {
             let distance = (center[0] - pad.center[0]).hypot(center[1] - pad.center[1]);

@@ -2,9 +2,10 @@ use git_koi::history::{
     AccountSnapshot, ConflictingRepository, OwnedRepository, RepositoryObservation,
     RepositoryVisibility,
 };
-use git_koi::pond::{
-    Bloom, MAX_PADS, POND_HEIGHT_PIXELS, POND_WIDTH_PIXELS, PadSize, PondError, layout_pond,
-};
+use git_koi::pond::{Bloom, MAX_PADS, PadSize, PondError, layout_pond};
+
+const POND_WIDTH: u32 = 416;
+const POND_HEIGHT: u32 = 192;
 
 fn observation(
     repository_id: u64,
@@ -90,7 +91,10 @@ fn only_owned_public_non_fork_repositories_get_pads() {
         ],
         Some(vec![owned(1, 5), owned(2, 5), owned(3, 5)]),
     );
-    assert_eq!(ids(&layout_pond(&account_snapshot).unwrap()), vec![1]);
+    assert_eq!(
+        ids(&layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap()),
+        vec![1]
+    );
 }
 
 #[test]
@@ -100,14 +104,14 @@ fn thirteen_repositories_keep_the_twelve_with_most_commits() {
     // Repository 5 has the fewest commits.
     owned_repositories[4].owner_commit_count = 1;
     let account_snapshot = snapshot(9, repositories.clone(), Some(owned_repositories));
-    let layout = layout_pond(&account_snapshot).unwrap();
+    let layout = layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap();
     assert!(layout.pads.len() <= MAX_PADS);
     assert!(!ids(&layout).contains(&5));
 
     // On a tie the lower ID is kept.
     let tied: Vec<_> = (1..=13).map(|id| owned(id, 50)).collect();
     let account_snapshot = snapshot(9, repositories, Some(tied));
-    let layout = layout_pond(&account_snapshot).unwrap();
+    let layout = layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap();
     assert!(!ids(&layout).contains(&13));
     assert!(ids(&layout).contains(&12));
 }
@@ -135,7 +139,7 @@ fn flowers_follow_language_rank() {
         .map(|(id, _, commits)| owned(*id, *commits))
         .collect();
     let account_snapshot = snapshot(3, repositories, Some(owned_repositories));
-    let layout = layout_pond(&account_snapshot).unwrap();
+    let layout = layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap();
     let bloom_of = |id: u64| {
         layout
             .pads
@@ -159,7 +163,7 @@ fn a_repository_without_a_language_gets_a_plain_pad() {
         vec![public(1, None), public(2, Some("Rust"))],
         Some(vec![owned(1, 500), owned(2, 1)]),
     );
-    let layout = layout_pond(&account_snapshot).unwrap();
+    let layout = layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap();
     assert_eq!(layout.pads.len(), 2);
     for pad in &layout.pads {
         match pad.repository_id {
@@ -172,13 +176,18 @@ fn a_repository_without_a_language_gets_a_plain_pad() {
 #[test]
 fn no_owned_repositories_gives_an_empty_pond() {
     let account_snapshot = snapshot(1, vec![public(1, Some("Rust"))], Some(vec![]));
-    assert!(layout_pond(&account_snapshot).unwrap().pads.is_empty());
+    assert!(
+        layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT)
+            .unwrap()
+            .pads
+            .is_empty()
+    );
 }
 
 #[test]
 fn a_version_3_snapshot_has_no_pond() {
     let account_snapshot = snapshot(1, vec![public(1, Some("Rust"))], None);
-    let error = layout_pond(&account_snapshot).unwrap_err();
+    let error = layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap_err();
     assert_eq!(error, PondError::NoOwnedRepositories);
     assert_eq!(
         error.to_string(),
@@ -194,7 +203,7 @@ fn conflicting_observations_are_an_error() {
         Some(vec![owned(1, 5)]),
     );
     assert_eq!(
-        layout_pond(&account_snapshot),
+        layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT),
         Err(PondError::ConflictingRepository(ConflictingRepository {
             repository_id: 1
         }))
@@ -207,8 +216,8 @@ fn the_layout_is_the_same_every_time() {
     let owned_repositories: Vec<_> = (1..=8).map(|id| owned(id, id * 13)).collect();
     let account_snapshot = snapshot(77, repositories, Some(owned_repositories));
     assert_eq!(
-        layout_pond(&account_snapshot).unwrap(),
-        layout_pond(&account_snapshot).unwrap()
+        layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap(),
+        layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap()
     );
 }
 
@@ -223,8 +232,8 @@ fn adding_a_repository_keeps_the_other_pads_in_place() {
     let mut more_owned = owned_repositories;
     more_owned.push(owned(4, 2));
     let after = snapshot(5, more_repositories, Some(more_owned));
-    let before_layout = layout_pond(&before).unwrap();
-    let after_layout = layout_pond(&after).unwrap();
+    let before_layout = layout_pond(&before, POND_WIDTH, POND_HEIGHT).unwrap();
+    let after_layout = layout_pond(&after, POND_WIDTH, POND_HEIGHT).unwrap();
     assert_eq!(before_layout.pads.len(), 3);
     for pad in &before_layout.pads {
         let kept = after_layout
@@ -246,13 +255,13 @@ fn pads_never_overlap_or_leave_the_pond() {
             repositories.clone(),
             Some(owned_repositories.clone()),
         );
-        let layout = layout_pond(&account_snapshot).unwrap();
+        let layout = layout_pond(&account_snapshot, POND_WIDTH, POND_HEIGHT).unwrap();
         for pad in &layout.pads {
             let radius = f64::from(pad.size.diameter_pixels()) / 2.0;
             assert!(pad.center[0] - radius >= 0.0);
-            assert!(pad.center[0] + radius <= f64::from(POND_WIDTH_PIXELS));
+            assert!(pad.center[0] + radius <= f64::from(POND_WIDTH));
             assert!(pad.center[1] - radius >= 0.0);
-            assert!(pad.center[1] + radius <= f64::from(POND_HEIGHT_PIXELS));
+            assert!(pad.center[1] + radius <= f64::from(POND_HEIGHT));
             assert!((0.0..std::f64::consts::TAU).contains(&pad.notch_radians));
         }
         for (index, first) in layout.pads.iter().enumerate() {
@@ -285,7 +294,12 @@ fn every_language_past_the_third_gets_a_bud_on_its_biggest_pad() {
             owned_repositories.push(owned(id, if index == 0 { 30 } else { 1 }));
         }
     }
-    let layout = layout_pond(&snapshot(4, repositories, Some(owned_repositories))).unwrap();
+    let layout = layout_pond(
+        &snapshot(4, repositories, Some(owned_repositories)),
+        POND_WIDTH,
+        POND_HEIGHT,
+    )
+    .unwrap();
     let bloom_of = |id: u64| {
         layout
             .pads
@@ -306,4 +320,68 @@ fn every_language_past_the_third_gets_a_bud_on_its_biggest_pad() {
         .filter(|pad| pad.bloom == Some(Bloom::Bud))
         .count();
     assert_eq!(buds, 3);
+}
+
+#[test]
+fn the_416_by_192_layout_is_pinned() {
+    let repositories: Vec<_> = (1..=8).map(|id| public(id, Some("Rust"))).collect();
+    let owned_repositories: Vec<_> = (1..=8).map(|id| owned(id, id * 13)).collect();
+    let account_snapshot = snapshot(77, repositories, Some(owned_repositories));
+    let layout = layout_pond(&account_snapshot, 416, 192).unwrap();
+    let centers: Vec<(u64, [f64; 2])> = layout
+        .pads
+        .iter()
+        .map(|pad| (pad.repository_id, pad.center))
+        .collect();
+    assert!(centers.contains(&(2, [213.0, 42.0])));
+    assert!(centers.contains(&(7, [65.0, 54.0])));
+    let pad_one = layout
+        .pads
+        .iter()
+        .find(|pad| pad.repository_id == 1)
+        .unwrap();
+    assert!((pad_one.center[0] - 317.204214339956).abs() < 1e-9);
+    assert!((pad_one.center[1] - 83.77183356970757).abs() < 1e-9);
+}
+
+#[test]
+fn pads_fit_ponds_of_any_size() {
+    let repositories: Vec<_> = (1..=12).map(|id| public(id, Some("Rust"))).collect();
+    let owned_repositories: Vec<_> = (1..=12).map(|id| owned(id, 1000)).collect();
+    for (width, height) in [(416, 192), (400, 800), (960, 540), (1280, 720)] {
+        for account_id in 1..=20 {
+            let account_snapshot = snapshot(
+                account_id,
+                repositories.clone(),
+                Some(owned_repositories.clone()),
+            );
+            let layout = layout_pond(&account_snapshot, width, height).unwrap();
+            for pad in &layout.pads {
+                let radius = f64::from(pad.size.diameter_pixels()) / 2.0;
+                assert!(pad.center[0] - radius >= 0.0, "{width}x{height}");
+                assert!(
+                    pad.center[0] + radius <= f64::from(width),
+                    "{width}x{height}"
+                );
+                assert!(pad.center[1] - radius >= 0.0, "{width}x{height}");
+                assert!(
+                    pad.center[1] + radius <= f64::from(height),
+                    "{width}x{height}"
+                );
+            }
+            for (index, first) in layout.pads.iter().enumerate() {
+                for second in &layout.pads[index + 1..] {
+                    let radii =
+                        f64::from(first.size.diameter_pixels() + second.size.diameter_pixels())
+                            / 2.0;
+                    let distance = (first.center[0] - second.center[0])
+                        .hypot(first.center[1] - second.center[1]);
+                    assert!(
+                        distance >= radii + 2.0,
+                        "{width}x{height} account {account_id}"
+                    );
+                }
+            }
+        }
+    }
 }
